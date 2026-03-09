@@ -1,0 +1,10 @@
+
+/mnt/e/Columbia/RA/gpu-bug-reproductions/tilelang/issue_96/kernel_clean.cu: error: possible write-write race on buf_dyn_shmem[8258]:
+
+Write by thread 66 in thread block 0 (global id 66), /mnt/e/Columbia/RA/gpu-bug-reproductions/tilelang/issue_96/kernel_clean.cu:17:75:
+  buf_dyn_shmem[((ko + 2) % 3) * 4096 + i * blockDim.x + threadIdx.x] =
+
+Write by thread 64 in thread block 0 (global id 64), /mnt/e/Columbia/RA/gpu-bug-reproductions/tilelang/issue_96/kernel_clean.cu:17:75:
+  buf_dyn_shmem[((ko + 2) % 3) * 4096 + i * blockDim.x + threadIdx.x] =
+
+GPUVerify kernel analyser finished with 0 verified, 1 error
