@@ -1,0 +1,10 @@
+
+/mnt/e/Columbia/RA/gpu-bug-reproductions/tilelang/issue_1257/kernel_clean.cu: error: possible atomic-read race on shared[2]:
+
+Read by thread 34 in thread block 0 (global id 34), /mnt/e/Columbia/RA/gpu-bug-reproductions/tilelang/issue_1257/kernel_clean.cu:6:27:
+  a[((int)threadIdx.x)] = shared[(((int)threadIdx.x) ^ 32)];
+
+Atomic by thread 2 in thread block 0 (global id 2), /mnt/e/Columbia/RA/gpu-bug-reproductions/tilelang/issue_1257/kernel_clean.cu:5:3:
+  atomicAdd(&(shared[((int)threadIdx.x)]), 1);
+
+GPUVerify kernel analyser finished with 0 verified, 1 error
