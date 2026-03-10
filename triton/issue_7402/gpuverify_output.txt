@@ -1,0 +1,14 @@
+GPUVerify Analysis — Triton issue #7402
+========================================
+Command:
+  python GPUVerify.py --cuda --blockDim=128 --gridDim=1 kernel_clean.cu
+
+Output:
+  error: possible write-write race on out[0]:
+    Write by thread 1 in thread block 0 (global id 1):
+      out[write_index * ROW_WIDTH + i] = 2;
+    Write by thread 0 in thread block 0 (global id 0):
+      out[write_index * ROW_WIDTH + i] = 2;
+  GPUVerify kernel analyser finished with 0 verified, 1 error
+
+Status: RACE DETECTED — 1 error
