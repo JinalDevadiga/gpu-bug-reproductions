@@ -1,0 +1,17 @@
+GPUVerify Analysis — Triton issue #7264
+========================================
+Command:
+  python GPUVerify.py --cuda --blockDim=1024 --gridDim=1 kernel_clean.cu
+
+Output:
+  error: possible write-read race on s_data[513]:
+    Read  by thread 1   (global id 1):   s_data[tid] += s_data[tid + stride];
+    Write by thread 513 (global id 513): s_data[tid] += s_data[tid + stride];
+
+  error: possible read-write race on s_data[1]:
+    Write by thread 1   (global id 1):   s_data[tid] += s_data[tid + stride];
+    Read  by thread 129 (global id 129): s_data[tid] += s_data[tid + stride];
+
+  GPUVerify kernel analyser finished with 0 verified, 2 errors
+
+Status: RACE DETECTED — 2 errors (matches compute-sanitizer 2 hazards)
