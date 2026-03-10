@@ -1,0 +1,30 @@
+GPUVerify Analysis — Triton issue #4362
+========================================
+Command:
+  python GPUVerify.py --cuda --blockDim=4 --gridDim=1 kernel_clean.cu
+
+Output:
+  GPUVerify kernel analyser finished with 1 verified, 0 errors
+  Verified: kernel_clean.cu
+  - no data races within thread blocks
+  - no data races between thread blocks
+  - no barrier divergence
+  - no assertion failures
+  (but absolutely no warranty provided)
+
+Status: FALSE NEGATIVE
+
+This bug is an algorithmic ordering error in Triton's reverse scan lowering,
+not a data race. Each thread operates on a distinct index with proper
+__syncthreads() around shared memory loads — GPUVerify sees no race.
+
+The wrong results arise from incorrect accumulation logic:
+  - Triton 3.0.0 scans left-to-right on reversed indices instead of
+    right-to-left, broadcasting the final accumulated value to all positions
+  - exp output: [2.4, 2.4, 2.4, 2.4] instead of [2.4, 2.4, 1.6, 2.0]
+  - This is a semantic/logical bug, not a synchronisation bug
+
+GPUVerify cannot detect:
+  - Wrong algorithmic ordering or scan direction errors
+  - Incorrect accumulation logic
+  - Silent wrong results from semantic bugs
