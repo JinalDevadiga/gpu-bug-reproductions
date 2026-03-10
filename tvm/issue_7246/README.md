@@ -8,8 +8,7 @@
 ## Approach
 
 `apache-tvm==0.8.0` (the buggy version) is not available as a pip wheel —
-the oldest available release is `0.9.0`. TIR inspection approach used —
-same as Triton #8311.
+the oldest available release is `0.9.0`. TIR inspection approach is used to confirm the fix.
 
 ## What is the Bug?
 
