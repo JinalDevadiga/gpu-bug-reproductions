@@ -1,0 +1,16 @@
+GPUVerify Analysis — TVM issue #17439
+======================================
+Command:
+  python GPUVerify.py --cuda --blockDim=16,16 --gridDim=4,4 kernel_clean.cu
+
+Output:
+  kernel_clean.cu: error: possible read-write race on C_shared[1]:
+  Write by thread (0, 0) in thread block (1, 1) (global id (16, 16)),
+    kernel_clean.cu:66:37:
+    C_shared[cse_var_1] = C_shared[cse_var_1]
+  Read by thread (8, 8) in thread block (1, 1) (global id (24, 24)),
+    kernel_clean.cu:66:39:
+    C_shared[cse_var_1] = C_shared[cse_var_1]
+  GPUVerify kernel analyser finished with 0 verified, 1 error
+
+Status: RACE DETECTED
