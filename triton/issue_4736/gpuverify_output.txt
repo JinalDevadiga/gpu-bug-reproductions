@@ -1,0 +1,25 @@
+GPUVerify Analysis — Triton issue #4736
+========================================
+Command:
+  python GPUVerify.py --cuda --blockDim=32 --gridDim=1 kernel_clean.cu
+
+Output:
+  error: possible write-read race on s_val[8]:
+    Read  by thread 0: float other_val = s_val[tid + stride];
+    Write by thread 8: s_val[tid] = keep_left ? s_val[tid] : other_val;
+
+  error: possible write-read race on s_idx[8]:
+    Read  by thread 0: int other_idx = s_idx[tid + stride];
+    Write by thread 8: s_idx[tid] = keep_left ? s_idx[tid] : other_idx;
+
+  error: possible read-write race on s_val[0]:
+    Write by thread 0: s_val[tid] = keep_left ? s_val[tid] : other_val;
+    Read  by thread 3: s_val[tid + stride] / s_val[tid] (multiple sources)
+
+  error: possible read-write race on s_idx[0]:
+    Write by thread 0: s_idx[tid] = keep_left ? s_idx[tid] : other_idx;
+    Read  by thread 3: s_idx[tid + stride] / s_idx[tid] (multiple sources)
+
+  GPUVerify kernel analyser finished with 0 verified, 4 errors
+
+Status: RACE DETECTED — 4 errors
