@@ -1,0 +1,17 @@
+GPUVerify Analysis — Triton issue #8311
+========================================
+Command:
+  python GPUVerify.py --cuda --blockDim=32 --gridDim=1 kernel_clean.cu
+
+Output:
+  error: possible write-read race on s_x[1]:
+    Read  by thread 17 (consumer): out[idx] = s_x[idx] * s_y[idx];
+    Write by thread 1  (producer): s_x[tid] = x_tile[tid];
+
+  error: possible write-read race on s_y[1]:
+    Read  by thread 17 (consumer): out[idx] = s_x[idx] * s_y[idx];
+    Write by thread 1  (producer): s_y[tid] = y_tile[tid];
+
+  GPUVerify kernel analyser finished with 0 verified, 2 errors
+
+Status: RACE DETECTED — 2 errors
