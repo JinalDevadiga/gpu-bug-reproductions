@@ -15,8 +15,6 @@
 
 > Note: This bug is related to code generation and should reproduce on any CUDA-capable NVIDIA GPU.
 
-
-
 ## What is the Bug?
 
 TileLang version 0.1.6 generated CUDA kernels that were missing a
@@ -113,3 +111,66 @@ The numerical output may still show the correct sum (1024) even with the
 bug present, because race conditions are non-deterministic — they do not
 always produce wrong values on every run. The bug is confirmed by inspecting
 the generated CUDA source code directly, not just the output values.
+
+---
+
+## Static Analysis Results
+
+### GPUVerify
+
+| Property | Value |
+|----------|-------|
+| Result | **RACE DETECTED** |
+| Classification | ✅ True Positive |
+| Race Type | Atomic-Read Race |
+| Details | Thread 34 reads `shared[2]` while Thread 2 performs `atomicAdd` on `shared[2]` |
+
+GPUVerify output:
+```
+error: possible atomic-read race on shared[2]:
+Read by thread 34 in thread block 0, line 6
+Atomic by thread 2 in thread block 0, line 5
+GPUVerify kernel analyser finished with 0 verified, 1 error
+```
+
+### Faial
+
+| Property | Value |
+|----------|-------|
+| Result | **RACE DETECTED** |
+| Classification | ✅ True Positive |
+| Race Type | Atomic-Read Race |
+| Faial Version | faial-drf (built from source, gitlab.com/umb-svl/faial) |
+| Command | `faial-drf --cu-to-json=/usr/local/bin/cu-to-json kernel_clean.cu` |
+
+Faial output:
+```
+Kernel 'test_kernel_kernel' has 1 data-race.
+~~~~ Data-race 1 (CIDI) ~~~~
+5 |   atomicAdd(&(shared[((int)threadIdx.x)]), 1);
+6 |   a[((int)threadIdx.x)] = shared[(((int)threadIdx.x) ^ 32)];
+Globals
+  shared[] = 0  |  blockIdx: x=0, y=0, z=0
+Locals
+  threadIdx: x=32, y=0, z=0  |  threadIdx: x=0, y=0, z=0
+True alarm detected!
+```
+
+#### How Faial Found This Bug
+Faial correctly identified that:
+- Thread 32 reads `shared[32 ^ 32] = shared[0]` on line 6
+- Thread 0 performs `atomicAdd` on `shared[0]` on line 5
+- There is no `__syncthreads()` between lines 5 and 6
+
+Faial automatically switched to **bit-vector arithmetic** to handle the XOR
+operator (`^`) used in the shared memory index expression, demonstrating its
+ability to reason about bitwise index computations.
+
+---
+
+## Tool Comparison Summary
+
+| Tool | Result | Classification | Notes |
+|------|--------|----------------|-------|
+| GPUVerify | RACE DETECTED | ✅ True Positive | Atomic-read race on shared[2] |
+| Faial | RACE DETECTED | ✅ True Positive | Same race, used bit-vector logic for XOR index |

@@ -116,3 +116,70 @@ This pattern indicates a potential race between:
 This bug is hardware-sensitive:
 * On H100: leads to incorrect numerical output due to async pipeline behavior
 * On other GPUs (e.g., RTX series): may not produce visible errors
+
+---
+
+## Static Analysis Results
+
+### GPUVerify
+
+| Property | Value |
+|----------|-------|
+| Result | **VERIFIED (no races found)** |
+| Classification | ❌ False Negative |
+| Race Type Missed | Async pipeline race (H100-specific) |
+
+GPUVerify output:
+```
+GPUVerify kernel analyser finished with 1 verified, 0 errors
+- no data races within thread blocks
+- no data races between thread blocks
+- no barrier divergence
+- no assertion failures
+```
+
+#### Why GPUVerify Missed This Bug
+The race is hardware-specific to H100's async pipeline execution model and
+relies on modern CUDA async primitives that GPUVerify (2018) does not
+understand. GPUVerify reasons at the thread synchronization level, not the
+hardware pipeline level.
+
+### Faial
+
+| Property | Value |
+|----------|-------|
+| Result | **DRF (Data-Race Free)** |
+| Classification | ❌ False Negative |
+| Race Type Missed | Async pipeline race (H100-specific) |
+| Faial Version | faial-drf (built from source, gitlab.com/umb-svl/faial) |
+| Command | `faial-drf --cu-to-json=/usr/local/bin/cu-to-json kernel_clean.cu` |
+
+Faial output:
+```
+Kernel 'main_kernel' is DRF!
+```
+
+#### Why Faial Missed This Bug
+Like GPUVerify, Faial reasons at the level of thread-level synchronization
+using barrier-phase analysis and SMT solving over memory access protocols.
+The race in issue #666 is not a thread-level data race in the classical sense
+— it is a **hardware async pipeline race** that only manifests on H100 due
+to its specific memory consistency and async execution behavior.
+
+Faial's analysis correctly determines that within any single barrier-separated
+phase, no two threads access the same shared memory location simultaneously.
+The race occurs at the hardware level between async pipeline stages, which is
+outside the scope of any static thread-level race detector.
+
+This is a **fundamental limitation** shared by both tools — neither can reason
+about hardware-specific async pipeline semantics introduced in post-Ampere
+GPU architectures.
+
+---
+
+## Tool Comparison Summary
+
+| Tool | Result | Classification | Notes |
+|------|--------|----------------|-------|
+| GPUVerify | Verified (DRF) | ❌ False Negative | Cannot reason about async hardware pipelines |
+| Faial | DRF | ❌ False Negative | Same limitation — hardware async pipeline out of scope |

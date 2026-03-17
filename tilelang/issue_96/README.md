@@ -95,3 +95,68 @@ This indicates a potential race between pipeline stages.
   * Limitation: This GPU cannot execute the kernel due to lack of SM80 MMA support
 (CUTE_ARCH_MMA_SM80_ENABLED error)
 * However, the problematic CUDA code pattern is still reproducible via compilation.
+
+---
+
+## Static Analysis Results
+
+### GPUVerify
+
+| Property | Value |
+|----------|-------|
+| Result | **RACE DETECTED** |
+| Classification | ✅ True Positive |
+| Race Type | Write-Write race (simplified kernel) |
+| Details | Thread 66 and Thread 64 both write to `buf_dyn_shmem[8258]` simultaneously via `((ko+2)%3)*4096 + ...` |
+
+GPUVerify output:
+```
+error: possible write-write race on buf_dyn_shmem[8258]:
+Write by thread 66 in thread block 0, line 17
+Write by thread 64 in thread block 0, line 17
+GPUVerify kernel analyser finished with 0 verified, 1 error
+```
+
+### Faial
+
+| Property | Value |
+|----------|-------|
+| Result | **DRF (Data-Race Free)** |
+| Classification | ❌ False Negative |
+| Race Type Missed | Cross-iteration Write-After-Read (WAR) hazard |
+| Faial Version | faial-drf (built from source, gitlab.com/umb-svl/faial) |
+| Command | `faial-drf --cu-to-json=/usr/local/bin/cu-to-json kernel_clean.cu` |
+
+Faial output:
+```
+Kernel 'main_kernel' is DRF!
+```
+
+#### Why Faial Missed This Bug
+
+Faial performs **barrier-phase analysis** — it checks whether two threads within
+the same thread block can race within the same barrier-separated phase. Within
+any single loop iteration `ko`:
+
+- Write goes to slot `(ko+2) % 3`
+- Read comes from slot `(ko % 3)`
+
+Since `(ko+2)%3 ≠ ko%3` for all `ko`, Faial correctly concludes there is no
+conflict **within one iteration**.
+
+However, the actual bug is a **cross-iteration hazard**: the slot written in
+iteration `ko` (i.e., `(ko+2)%3`) is the same slot read in iteration `ko+2`
+(i.e., `(ko+2)%3`). This inter-iteration reasoning is outside Faial's
+analysis scope, which does not track shared memory state across loop iterations.
+
+This is a **known limitation** of Faial's design — it is sound within a single
+barrier-phase but does not reason about multi-iteration pipeline overlaps.
+
+---
+
+## Tool Comparison Summary
+
+| Tool | Result | Classification | Notes |
+|------|--------|----------------|-------|
+| GPUVerify | RACE DETECTED | ✅ True Positive | Detected write-write race in simplified kernel |
+| Faial | DRF | ❌ False Negative | Cannot reason across loop iterations |
