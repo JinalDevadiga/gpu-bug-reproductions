@@ -32,11 +32,11 @@ but there is no synchronization barrier before `tt.dot`:
 ```
 %acc = scf.for %ko = ... iter_args(...) -> (...) {
   ...
-  %y_tile_51 = tt.load %y_tile_45, ...   ← async TMA load
+  %y_tile_51 = tt.load %y_tile_45, ...   <- async TMA load
   ...
-  %acc_58 = tt.dot %acc_54, %acc_57, ... ← proceeds WITHOUT waiting for load
+  %acc_58 = tt.dot %acc_54, %acc_57, ... <- proceeds WITHOUT waiting for load
   scf.yield %acc_58 ...
-} {tt.warp_specialize}                    ← warp split enabled, no sync barrier
+} {tt.warp_specialize}                    <- warp split enabled, no sync barrier
 ```
 
 On sm75 (this machine) TMA hardware does not exist, so the warp split never
@@ -72,9 +72,6 @@ python reproduce.py
 ```
 PASSED (sm90+ required to trigger bug — see README)
 ```
-The TTGIR dump shows `{tt.warp_specialize}` on the inner loop confirming
-the buggy code path was compiled, but TMA hardware is unavailable on sm75
-so the race never fires.
 
 ### On sm90+ (H100 / RTX 5090) — required to trigger bug:
 ```
@@ -82,3 +79,72 @@ BUG CONFIRMED
   Mismatched elements: 1041126 / 1048576 (99.3%)
   Greatest absolute difference: 139.0 at index (673, 708)
 ```
+
+---
+
+## Static Analysis Results
+
+### GPUVerify
+
+| Property | Value |
+|----------|-------|
+| Result | **RACE DETECTED — 2 errors** |
+| Classification | ✅ True Positive |
+| Race Type | Write-Read races on shared memory `s_x` and `s_y` between producer and consumer warps |
+
+GPUVerify output:
+```
+error: possible write-read race on s_x[1]:
+  Write by thread 1  (producer): s_x[tid] = x_tile[tid];
+  Read  by thread 17 (consumer): out[idx] = s_x[idx] * s_y[idx];
+
+error: possible write-read race on s_y[1]:
+  Write by thread 1  (producer): s_y[tid] = y_tile[tid];
+  Read  by thread 17 (consumer): out[idx] = s_x[idx] * s_y[idx];
+
+GPUVerify kernel analyser finished with 0 verified, 2 errors
+```
+
+### Faial
+
+| Property | Value |
+|----------|-------|
+| Result | **RACE DETECTED — 2 data-races** |
+| Classification | ✅ True Positive |
+| Race Type | Write-Read races on shared memory `s_x` and `s_y` between producer and consumer warps |
+| Faial Version | faial-drf (built from source, gitlab.com/umb-svl/faial) |
+| Command | `faial-drf --cu-to-json=/usr/local/bin/cu-to-json kernel_clean.cu` |
+
+Faial output:
+```
+Kernel 'warp_specialize_buggy' has 2 data-races.
+~~~~ Data-race 1 (CIDI) ~~~~
+35 |         s_x[tid] = x_tile[tid];
+45 |         out[idx] = s_x[idx] * s_y[idx];
+Locals: threadIdx x=16 (consumer) vs threadIdx x=0 (producer)
+True alarm detected!
+
+~~~~ Data-race 2 (CIDI) ~~~~
+36 |         s_y[tid] = y_tile[tid];
+45 |         out[idx] = s_x[idx] * s_y[idx];
+Locals: threadIdx x=16 (consumer) vs threadIdx x=0 (producer)
+True alarm detected!
+```
+
+#### How Faial Found These Races
+Faial correctly identified the classic producer-consumer pattern with a
+missing barrier. Thread 0 (producer) writes to `s_x[0]` on line 35 while
+Thread 16 (consumer) reads `s_x[0]` on line 45 — with no `__syncthreads()`
+between them. The same conflict occurs on `s_y`. Both are true alarms.
+
+Faial's result matches GPUVerify's exactly — **2 races**, both pinpointing
+the same missing barrier between the producer store and consumer load phases.
+
+---
+
+## Tool Comparison Summary
+
+| Tool | Result | Classification | Races Found | Notes |
+|------|--------|----------------|-------------|-------|
+| GPUVerify | RACE DETECTED | ✅ True Positive | 2 errors | Producer-consumer race on s_x and s_y |
+| Faial | RACE DETECTED | ✅ True Positive | 2 races | Exact match with GPUVerify |

@@ -27,31 +27,11 @@ stack_tcode = tvm_stack_alloca("arg_tcode", 8)   // <- shared by all threads
 parallel for (xo, 0, 2) {
   for (yo, 0, 2) {
     // Thread 0 and Thread 1 both write stack_value[0] = &A_tile, etc.
-    // Last writer wins -> wrong matmul args -> wrong result or crash
     tvm_call_packed_lowered("tvm.contrib.cblas.matmul",
                             stack_value, stack_tcode, 0, 5)
   }
 }
 ```
-
-## Observed TIR on TVM 0.11.1
-
-TVM 0.11.1 eliminates the stack allocation entirely, inlining all arguments
-as `tvm_stack_make_array` calls constructed inside the parallel loop:
-
-```
-for (i.outer: int32, 0, 2) "parallel" {
-  for (j.outer: int32, 0, 2) {
-    @tir.tvm_call_packed("tvm.contrib.cblas.matmul",
-      @tir.tvm_stack_make_array(A_2, ...),   // <- inline, thread-safe
-      @tir.tvm_stack_make_array(B_2, ...),   // <- inline, thread-safe
-      ...)
-  }
-}
-```
-
-No `tvm_stack_alloca` appears — confirming the buggy code path is no longer
-generated on this version.
 
 ## Requirements
 
@@ -76,3 +56,32 @@ python reproduce.py
 `src/tir/transforms/lower_tvm_builtin.cc` — the `LowerTVMBuiltin` pass
 lifted all `tvm_stack_alloca` nodes to the outermost scope (function body)
 regardless of whether they were inside a parallel loop.
+
+---
+
+## Static Analysis Results
+
+### GPUVerify
+
+| Property | Value |
+|----------|-------|
+| Result | **NOT APPLICABLE** |
+| Classification | ⚪ Not Applicable |
+| Reason | CPU-level race in TVM's parallel thread pool — no CUDA kernel involved. Buggy version (TVM 0.8.0) not available as pip wheel. |
+
+### Faial
+
+| Property | Value |
+|----------|-------|
+| Result | **NOT APPLICABLE** |
+| Classification | ⚪ Not Applicable |
+| Reason | Faial analyzes CUDA GPU kernels only. This is a CPU thread race in TVM's runtime (`tvm_stack_alloca` shared across OS threads). No CUDA kernel is generated for this bug. |
+
+---
+
+## Tool Comparison Summary
+
+| Tool | Result | Classification | Notes |
+|------|--------|----------------|-------|
+| GPUVerify | N/A | ⚪ Not Applicable | CPU race — no CUDA kernel |
+| Faial | N/A | ⚪ Not Applicable | CPU race — no CUDA kernel |

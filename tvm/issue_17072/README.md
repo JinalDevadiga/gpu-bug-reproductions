@@ -11,7 +11,7 @@
 This bug requires a high core-count machine to trigger reliably at runtime
 (reported on a 52-core Intel Xeon Gold 6230R). It is not reproducible at
 runtime on low core-count hardware (e.g. MX450 laptop). Source inspection
-approach used — same as Triton #8311.
+approach used.
 
 ## What is the Bug?
 
@@ -31,17 +31,11 @@ single shared `cache_`:
 - Thread B calls `cache_.insert(expr, ...)` simultaneously (writing)
 - HashTable is corrupted → **segmentation fault**
 
-TVM provides no warning that concurrent builds share this state.
-
 ## Symptom
 
 ```
 Segmentation fault
 ```
-
-Observed when launching 100 parallel threads each compiling a matmul
-operator, for a total of 100,000 compilations on a 52-core machine.
-The bug is flaky — probability scales with core count and task volume.
 
 ## Requirements
 
@@ -59,16 +53,41 @@ conda activate tvm-bugs    # apache-tvm 0.11.1
 ## How to Run
 
 ```bash
-# Default (32 threads, 500 tasks) — confirms faulty code location
 python reproduce.py
-
-# High load — more likely to trigger on many-core machines
-python reproduce.py 100 100000
+python reproduce.py 100 100000   # high load — more likely to trigger
 ```
 
 ## Root Cause
 
 `src/tir/transforms/common_subexpr_elim_tools.h#L115` — the
 `ComputationCache` is declared `static`, making it a single instance
-shared across all threads in the process. The CSE pass was not designed
-with concurrent compilation in mind.
+shared across all threads. The CSE pass was not designed for concurrent use.
+
+---
+
+## Static Analysis Results
+
+### GPUVerify
+
+| Property | Value |
+|----------|-------|
+| Result | **NOT APPLICABLE** |
+| Classification | ⚪ Not Applicable |
+| Reason | C++ compiler-level race on a static cache — no CUDA kernel involved. Requires 50+ cores to trigger reliably — not reproducible on this hardware. |
+
+### Faial
+
+| Property | Value |
+|----------|-------|
+| Result | **NOT APPLICABLE** |
+| Classification | ⚪ Not Applicable |
+| Reason | Faial analyzes CUDA GPU kernels only. This is a C++ thread race on a static `ComputationCache` inside TVM's compiler pipeline. No CUDA kernel is generated or involved. |
+
+---
+
+## Tool Comparison Summary
+
+| Tool | Result | Classification | Notes |
+|------|--------|----------------|-------|
+| GPUVerify | N/A | ⚪ Not Applicable | C++ compiler race — no CUDA kernel |
+| Faial | N/A | ⚪ Not Applicable | C++ compiler race — no CUDA kernel |

@@ -58,3 +58,73 @@ python reproduce.py
 # Racecheck — observe WAW hazards
 compute-sanitizer --tool=racecheck python reproduce.py
 ```
+
+---
+
+## Static Analysis Results
+
+### GPUVerify
+
+| Property | Value |
+|----------|-------|
+| Result | **RACE DETECTED — 4 errors** |
+| Classification | ✅ True Positive |
+| Race Type | WAW/RAW races on shared memory `s_val` and `s_idx` between butterfly stages |
+
+GPUVerify output:
+```
+error: possible write-read race on s_val[8]: thread 0 reads while thread 8 writes
+error: possible write-read race on s_idx[8]: thread 0 reads while thread 8 writes
+error: possible read-write race on s_val[0]: thread 0 writes while thread 3 reads
+error: possible read-write race on s_idx[0]: thread 0 writes while thread 3 reads
+GPUVerify kernel analyser finished with 0 verified, 4 errors
+```
+
+### Faial
+
+| Property | Value |
+|----------|-------|
+| Result | **RACE DETECTED — 2 data-races** |
+| Classification | ✅ True Positive |
+| Race Type | RAW/WAW races on shared memory `s_val` and `s_idx` between butterfly stages |
+| Faial Version | faial-drf (built from source, gitlab.com/umb-svl/faial) |
+| Command | `faial-drf --cu-to-json=/usr/local/bin/cu-to-json kernel_clean.cu` |
+
+Faial output:
+```
+Kernel 'min_reduction_buggy' has 2 data-races.
+~~~~ Data-race 1 (CIDI) ~~~~
+50 |             int   other_idx = s_idx[tid + stride];
+62 |             s_idx[tid] = keep_left ? s_idx[tid] : other_idx;
+Locals: stride=16 | threadIdx x=1  vs  stride=1 | threadIdx x=0
+True alarm detected!
+
+~~~~ Data-race 2 (CIDI) ~~~~
+49 |             float other_val = s_val[tid + stride];
+61 |             s_val[tid] = keep_left ? s_val[tid] : other_val;
+Locals: stride=16 | threadIdx x=7  vs  stride=4 | threadIdx x=3
+True alarm detected!
+```
+
+#### How Faial Found These Races
+Faial detected both races in the butterfly shuffle loop — one on `s_idx`
+and one on `s_val`. In both cases, one thread reads `s_val[tid + stride]`
+or `s_idx[tid + stride]` while another thread from a different stride
+iteration writes to the overlapping location, with no `__syncthreads()`
+between butterfly stages.
+
+Notably, Faial found exactly **2 races** — matching `compute-sanitizer`'s
+count of 2 hazards — while GPUVerify found 4 errors. Both counts are
+correct: GPUVerify reports each direction of the conflict separately
+(read-write AND write-read), while Faial and compute-sanitizer report
+each conflicting pair once.
+
+---
+
+## Tool Comparison Summary
+
+| Tool | Result | Classification | Races Found | Notes |
+|------|--------|----------------|-------------|-------|
+| compute-sanitizer | 2 hazards | ✅ True Positive | 2 | Runtime detection |
+| GPUVerify | RACE DETECTED | ✅ True Positive | 4 errors | Counts each direction separately |
+| Faial | RACE DETECTED | ✅ True Positive | 2 races | Matches compute-sanitizer count |

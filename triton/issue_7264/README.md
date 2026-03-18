@@ -28,11 +28,6 @@ Kernel result : 6.850529
 Reference     : 6.850526
 Numerically CORRECT (race is silent)
 ```
-```
-Kernel result : 41.672100     ← different value on second run!
-Reference     : 41.672104
-Numerically CORRECT (race is silent)
-```
 
 ### Under compute-sanitizer (race detected):
 ```
@@ -67,3 +62,70 @@ python reproduce.py
 # Racecheck — observe WAW hazards
 compute-sanitizer --tool racecheck python reproduce.py
 ```
+
+---
+
+## Static Analysis Results
+
+### GPUVerify
+
+| Property | Value |
+|----------|-------|
+| Result | **RACE DETECTED — 2 errors** |
+| Classification | ✅ True Positive |
+| Race Type | WAW/RAW races on shared memory `s_data` between butterfly stages |
+
+GPUVerify output:
+```
+error: possible write-read race on s_data[513]:
+  Read  by thread 1,   Write by thread 513: s_data[tid] += s_data[tid + stride]
+error: possible read-write race on s_data[1]:
+  Write by thread 1,   Read  by thread 129: s_data[tid] += s_data[tid + stride]
+GPUVerify kernel analyser finished with 0 verified, 2 errors
+```
+
+### Faial
+
+| Property | Value |
+|----------|-------|
+| Result | **RACE DETECTED — 1 data-race** |
+| Classification | ✅ True Positive |
+| Race Type | RAW race on shared memory `s_data` between butterfly stages |
+| Faial Version | faial-drf (built from source, gitlab.com/umb-svl/faial) |
+| Command | `faial-drf --cu-to-json=/usr/local/bin/cu-to-json kernel_clean.cu` |
+
+Faial output:
+```
+Kernel 'reduction_buggy' has 1 data-race.
+~~~~ Data-race 1 (CIDI) ~~~~
+40 |             s_data[tid] += s_data[tid + stride];
+Globals: s_data[] = 65  |  blockIdx: x=0, y=0, z=0
+Locals:
+  stride=128, threadIdx x=65  vs  stride=64, threadIdx x=1
+True alarm detected!
+```
+
+#### How Faial Found This Race
+Faial identified that on line 40 (`s_data[tid] += s_data[tid + stride]`),
+Thread 65 with `stride=128` reads `s_data[65 + 128] = s_data[193]` while
+Thread 1 with `stride=64` writes `s_data[1]` — with no `__syncthreads()`
+between butterfly iterations, these accesses from different stride stages
+overlap and conflict.
+
+#### Race Count Comparison
+Faial reports **1 race** while GPUVerify reports **2 errors** and
+compute-sanitizer reports **2 hazards**. This is consistent with the
+pattern seen in issue #4736 — Faial reports each conflicting pair once,
+while GPUVerify counts each direction of the conflict separately
+(read-write AND write-read). All three tools identify the same underlying
+missing `__syncthreads()` bug.
+
+---
+
+## Tool Comparison Summary
+
+| Tool | Result | Classification | Races Found | Notes |
+|------|--------|----------------|-------------|-------|
+| compute-sanitizer | 2 hazards | ✅ True Positive | 2 | Runtime detection |
+| GPUVerify | RACE DETECTED | ✅ True Positive | 2 errors | Counts each direction separately |
+| Faial | RACE DETECTED | ✅ True Positive | 1 race | Reports each conflict once |

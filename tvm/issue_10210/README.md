@@ -31,9 +31,6 @@ Parallel-reduction GEMM (10 runs) — max error: 29.68,  min error: 27.05
 
 -> BUG CONFIRMED: parallel reduction race detected.
    max_error=29.68 >> 1.0 tolerance.
-   Multiple threads wrote to the same C[i][j] accumulator without
-   synchronisation -> lost updates -> wrong result.
-   TVM emitted no warning during compilation.
 ```
 
 ## Requirements
@@ -59,6 +56,35 @@ python reproduce.py
 
 `src/te/schedule/schedule_lang.cc` — `Stage::parallel()` does not check
 whether the target axis is a spatial or reduction axis before marking it
-`ForKind::kParallel`. The threadpool in `src/runtime/thread_pool.cc` then
-launches independent threads for each k-iteration, all performing
-non-atomic read-modify-write on the same output element.
+`ForKind::kParallel`. The threadpool then launches independent threads for
+each k-iteration, all performing non-atomic read-modify-write on the same
+output element.
+
+---
+
+## Static Analysis Results
+
+### GPUVerify
+
+| Property | Value |
+|----------|-------|
+| Result | **NOT APPLICABLE** |
+| Classification | ⚪ Not Applicable |
+| Reason | CPU-level race on the accumulator array — no CUDA kernel involved. |
+
+### Faial
+
+| Property | Value |
+|----------|-------|
+| Result | **NOT APPLICABLE** |
+| Classification | ⚪ Not Applicable |
+| Reason | Faial analyzes CUDA GPU kernels only. This is a CPU thread race where multiple OS threads write to the same accumulator `C[i][j]` without synchronisation. No CUDA kernel is involved. |
+
+---
+
+## Tool Comparison Summary
+
+| Tool | Result | Classification | Notes |
+|------|--------|----------------|-------|
+| GPUVerify | N/A | ⚪ Not Applicable | CPU race — no CUDA kernel |
+| Faial | N/A | ⚪ Not Applicable | CPU race — no CUDA kernel |
