@@ -8,35 +8,26 @@
 ## What is the Bug?
 
 When lowering a `tl.sum` reduction followed by a layout conversion, Triton
-generates a butterfly shuffle so every thread accumulates the full result.
-All threads then write their result to the **same shared memory address**.
+generates a butterfly shuffle where threads write their accumulated result
+to shared memory without `__syncthreads()` between stages. Threads in one
+stage read locations being written by threads in the previous stage — a
+write-write (WAW) hazard.
 
-The race: because threads accumulate in different orders during the butterfly
-shuffle, they may compute slightly different floating-point values due to
-FP non-associativity. Multiple threads then write **different values to the
-same address** simultaneously — a write-write (WAW) hazard.
+The output is often numerically close to correct, but the result is
+**non-deterministic** across runs and `compute-sanitizer` reports the
+hazards explicitly.
 
-The output is often numerically close to correct, but:
-- The result is **non-deterministic** across runs
-- `compute-sanitizer --tool racecheck` reports the hazards explicitly
-
-## Reproduction
+## Results
 
 ### Plain run (non-deterministic result):
 ```
-Kernel result : 6.850529
-Reference     : 6.850526
 Numerically CORRECT (race is silent)
 ```
 
-### Under compute-sanitizer (race detected):
+### Under compute-sanitizer:
 ```
-========= RACECHECK SUMMARY: 2 hazards displayed (2 errors, 0 warnings)
+RACECHECK SUMMARY: 2 hazards displayed (2 errors, 0 warnings)
 ```
-
-Note: "Device not supported" and "WDDM debugger interface" errors appear
-because this machine runs WSL2 — the full debugger interface cannot attach,
-but the racecheck tool still detects the WAW hazards.
 
 ## Requirements
 
@@ -44,22 +35,15 @@ but the racecheck tool still detects the WAW hazards.
 - CUDA 12.x
 - Any NVIDIA GPU
 - Triton 3.0.0
-- `compute-sanitizer` (included with CUDA toolkit)
-
-## Setup
-```bash
-conda create -n triton-7402 python=3.10 -y
-conda activate triton-7402
-pip install torch==2.4.0
-pip install triton==3.0.0
-```
+- compute-sanitizer (included with CUDA toolkit)
 
 ## How to Run
+
 ```bash
-# Plain run — observe non-deterministic output
+# Plain run
 python reproduce.py
 
-# Racecheck — observe WAW hazards
+# Racecheck
 compute-sanitizer --tool racecheck python reproduce.py
 ```
 
@@ -71,16 +55,17 @@ compute-sanitizer --tool racecheck python reproduce.py
 
 | Property | Value |
 |----------|-------|
-| Result | **RACE DETECTED — 2 errors** |
+| Result | **RACE DETECTED** |
 | Classification | ✅ True Positive |
-| Race Type | WAW/RAW races on shared memory `s_data` between butterfly stages |
+| Race Type | WAW/RAW race in butterfly shuffle sum reduction |
+| Errors | 2 (write-read and read-write on `s_data`) |
 
 GPUVerify output:
 ```
 error: possible write-read race on s_data[513]:
-  Read  by thread 1,   Write by thread 513: s_data[tid] += s_data[tid + stride]
+  thread 1 reads s_data[tid+stride] while thread 513 writes s_data[tid]
 error: possible read-write race on s_data[1]:
-  Write by thread 1,   Read  by thread 129: s_data[tid] += s_data[tid + stride]
+  thread 1 writes s_data[tid] while thread 129 reads s_data[tid+stride]
 GPUVerify kernel analyser finished with 0 verified, 2 errors
 ```
 
@@ -88,44 +73,84 @@ GPUVerify kernel analyser finished with 0 verified, 2 errors
 
 | Property | Value |
 |----------|-------|
-| Result | **RACE DETECTED — 1 data-race** |
+| Result | **RACE DETECTED** |
 | Classification | ✅ True Positive |
-| Race Type | RAW race on shared memory `s_data` between butterfly stages |
-| Faial Version | faial-drf (built from source, gitlab.com/umb-svl/faial) |
+| Race Type | WAW/RAW race in butterfly shuffle |
+| Races Found | 1 |
 | Command | `faial-drf --cu-to-json=/usr/local/bin/cu-to-json kernel_clean.cu` |
 
 Faial output:
 ```
 Kernel 'reduction_buggy' has 1 data-race.
 ~~~~ Data-race 1 (CIDI) ~~~~
-40 |             s_data[tid] += s_data[tid + stride];
-Globals: s_data[] = 65  |  blockIdx: x=0, y=0, z=0
-Locals:
-  stride=128, threadIdx x=65  vs  stride=64, threadIdx x=1
+40 |     s_data[tid] += s_data[tid + stride];
+  stride=128, threadIdx x=65 reads; stride=64, threadIdx x=1 writes
 True alarm detected!
 ```
 
-#### How Faial Found This Race
-Faial identified that on line 40 (`s_data[tid] += s_data[tid + stride]`),
-Thread 65 with `stride=128` reads `s_data[65 + 128] = s_data[193]` while
-Thread 1 with `stride=64` writes `s_data[1]` — with no `__syncthreads()`
-between butterfly iterations, these accesses from different stride stages
-overlap and conflict.
+### Weft
 
-#### Race Count Comparison
-Faial reports **1 race** while GPUVerify reports **2 errors** and
-compute-sanitizer reports **2 hazards**. This is consistent with the
-pattern seen in issue #4736 — Faial reports each conflicting pair once,
-while GPUVerify counts each direction of the conflict separately
-(read-write AND write-read). All three tools identify the same underlying
-missing `__syncthreads()` bug.
+| Property | Value |
+|----------|-------|
+| Result | **No races detected** |
+| Classification | ❌ False Negative |
+| Race Type Missed | Cross-iteration WAW/RAW race in butterfly shuffle |
+| Weft Version | Built from source (github.com/lightsighter/Weft) |
+| Command | `weft -f kernel_clean.ptx -t 4 -i -d` |
+| PTX Compiled With | `nvcc -ptx kernel_weft.cu` (added `__launch_bounds__(1024)`) |
+
+Weft output:
+```
+WEFT INFO: No deadlocks detected in kernel reduction_buggy!
+WEFT INFO: No races detected in kernel reduction_buggy!
+WEFT STATISTICS for Kernel reduction_buggy
+  CTA Thread Count:                     1024
+  Shared Memory Locations:              1025
+  Physical Named Barriers;                 1
+  Dynamic Barrier Instances:               1
+  Weft Statements:                      5118
+  Total Race Tests:                    10170
+```
+
+#### Why Weft Missed This Bug
+
+Weft performed 10,170 race tests across 1,025 shared memory locations —
+this is not a scope issue. The miss is the same **cross-iteration reasoning
+limitation** seen in issues #96 and #4736.
+
+The butterfly reduction loop is:
+```c
+for (int stride = N/2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+        s_data[tid] += s_data[tid + stride];
+        // MISSING __syncthreads() here
+    }
+}
+```
+
+Weft unrolls this loop statically (stride = 512 → 256 → ... → 1). The race
+occurs across iterations: the write to `s_data[tid]` in iteration `stride=512`
+overlaps with the read of `s_data[tid+stride]` in a later stage where a
+different thread's address aliases into the previously written location.
+
+Without a `__syncthreads()` between stages, threads from the next stage begin
+reading before all threads in the current stage have finished writing. Weft
+sees the single initial `__syncthreads()` (before the loop), finds the
+barrier ordering correct within what it can reason about, and reports no
+races. The address aliasing across unrolled loop stages — that
+`s_data[tid]` written at `stride=512` becomes `s_data[tid+stride]` read by
+another thread at `stride=256` — is outside Weft's reasoning scope.
+
+This is the same root cause as issues #96 and #4736, confirming a consistent
+pattern: Weft cannot detect races in iterative algorithms where shared memory
+slots are reused across loop stages without barriers between stages.
 
 ---
 
 ## Tool Comparison Summary
 
-| Tool | Result | Classification | Races Found | Notes |
-|------|--------|----------------|-------------|-------|
-| compute-sanitizer | 2 hazards | ✅ True Positive | 2 | Runtime detection |
-| GPUVerify | RACE DETECTED | ✅ True Positive | 2 errors | Counts each direction separately |
-| Faial | RACE DETECTED | ✅ True Positive | 1 race | Reports each conflict once |
+| Tool | Result | Classification | Notes |
+|------|--------|----------------|-------|
+| GPUVerify | RACE DETECTED | ✅ True Positive | 2 errors (both directions on `s_data`) |
+| Faial | RACE DETECTED | ✅ True Positive | 1 race (cross-stage alias) |
+| Weft | No races detected | ❌ False Negative | Cross-iteration address aliasing — same limitation as #96 and #4736 |

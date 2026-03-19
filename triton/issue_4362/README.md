@@ -34,15 +34,15 @@ vals : [1.0, 0.5, 0.9, 3.8]
 
 ### reverse=True (buggy):
 ```
-exp  result  : [2.4, 2.4, 2.4, 2.4]      <- all identical, wrong
+exp  result  : [2.4, 2.4, 2.4, 2.4]      ← all identical, wrong
 exp  expected: [2.4, 2.4, 1.6, 2.0]
-vals result  : [3.15, 4.55, 2.1, 3.5]    <- wrong
+vals result  : [3.15, 4.55, 2.1, 3.5]    ← wrong
 vals expected: [3.15, 2.15, 2.1, 2.0]
 ```
 
-The `exp` output is all `2.4` — the final accumulated value broadcast to
-every position — indicating the scan is not respecting element ordering when
-reversing, effectively reducing rather than scanning.
+The `exp` output is all 2.4 — the final accumulated value broadcast to
+every position — indicating the scan is not respecting element ordering
+when reversing.
 
 ## Requirements
 
@@ -51,15 +51,8 @@ reversing, effectively reducing rather than scanning.
 - Any NVIDIA GPU
 - Triton 3.0.0
 
-## Setup
-```bash
-conda create -n triton-7402 python=3.12 -y
-conda activate triton-7402
-pip install torch==2.4.0
-pip install triton==3.0.0
-```
-
 ## How to Run
+
 ```bash
 python reproduce.py
 ```
@@ -72,18 +65,23 @@ python reproduce.py
 
 | Property | Value |
 |----------|-------|
-| Result | **VERIFIED (no races found)** |
+| Result | **Verified (no races found)** |
 | Classification | ❌ False Negative |
-| Race Type Missed | N/A — this is not a data race |
+| Reason | Algorithmic ordering bug — not a data race |
 
 GPUVerify output:
 ```
 GPUVerify kernel analyser finished with 1 verified, 0 errors
 - no data races within thread blocks
 - no data races between thread blocks
-- no barrier divergence
-- no assertion failures
 ```
+
+#### Why GPUVerify Missed This Bug
+
+Each thread operates on a distinct shared memory index with proper
+`__syncthreads()` around shared memory loads. The wrong results stem from
+incorrect scan direction logic in Triton's lowering, not from missing
+synchronization. GPUVerify only detects sync-based races.
 
 ### Faial
 
@@ -91,8 +89,7 @@ GPUVerify kernel analyser finished with 1 verified, 0 errors
 |----------|-------|
 | Result | **DRF (Data-Race Free)** |
 | Classification | ❌ False Negative |
-| Race Type Missed | N/A — this is not a data race |
-| Faial Version | faial-drf (built from source, gitlab.com/umb-svl/faial) |
+| Reason | Algorithmic ordering bug — not a data race |
 | Command | `faial-drf --cu-to-json=/usr/local/bin/cu-to-json kernel_clean.cu` |
 
 Faial output:
@@ -100,28 +97,50 @@ Faial output:
 Kernel 'associative_scan_buggy' is DRF!
 ```
 
-#### Why Both Tools Missed This Bug
+Same reason as GPUVerify — the kernel is genuinely race-free. Every thread
+writes to and reads from distinct memory locations with correct barriers.
+The bug is semantic, not synchronization-based.
 
-This bug is fundamentally different from all other issues in this repository
-— it is **not a data race at all**. Both Faial and GPUVerify are data race
-detectors, so neither can detect it. The bug is an **algorithmic ordering
-error** in Triton's compiler lowering of `reverse=True`:
+### Weft
 
-- Each thread reads and writes a **distinct index** — no two threads touch
-  the same memory location simultaneously
-- Barriers (`__syncthreads()`) are present around shared memory accesses
-- The kernel is genuinely race-free from a synchronisation perspective
+| Property | Value |
+|----------|-------|
+| Result | **No races detected** |
+| Classification | ❌ False Negative |
+| Reason | Algorithmic ordering bug — not a data race |
+| Weft Version | Built from source (github.com/lightsighter/Weft) |
+| Command | `weft -f kernel_clean.ptx -t 4 -i -d` |
+| PTX Compiled With | `nvcc -ptx kernel_weft.cu` (added `__launch_bounds__(4)`) |
 
-The wrong results come from Triton 3.0.0 scanning elements left-to-right
-on reversed indices instead of right-to-left, causing the final accumulated
-value to be broadcast to all positions. This is a **semantic/logical bug**
-in the compiler's code generation — the generated kernel is correctly
-synchronized but computes the wrong thing.
+Weft output:
+```
+WEFT INFO: No deadlocks detected in kernel associative_scan_buggy!
+WEFT INFO: No races detected in kernel associative_scan_buggy!
+WEFT STATISTICS for Kernel associative_scan_buggy
+  CTA Thread Count:                        4
+  Shared Memory Locations:                 5
+  Physical Named Barriers;                 1
+  Dynamic Barrier Instances:               1
+  Weft Statements:                        50
+  Total Race Tests:                      195
+```
 
-No static race detector can catch this class of bug because the kernel
-contains no race. Detecting it would require reasoning about the
-**semantic correctness** of the algorithm itself — a fundamentally different
-and much harder problem than race detection.
+#### Why Weft Missed This Bug
+
+Unlike issue #4233, this kernel does use shared memory (5 locations,
+195 race tests performed). Weft fully analyzed the shared memory accesses
+and correctly found no races — because there genuinely are none. The bug
+is an **algorithmic ordering error** in Triton's reverse scan lowering:
+the scan traverses elements in the wrong direction, broadcasting the final
+accumulated value to all positions instead of computing a proper reverse
+prefix scan. No two threads access the same shared memory address
+simultaneously without a barrier between them, so no race exists at the
+synchronization level.
+
+This is a **false negative shared by all three tools** — not because any
+tool is deficient, but because the bug is simply not a data race. It is a
+semantic correctness bug that requires understanding the intended algorithm,
+which is outside the scope of any synchronization-based race detector.
 
 ---
 
@@ -129,5 +148,6 @@ and much harder problem than race detection.
 
 | Tool | Result | Classification | Notes |
 |------|--------|----------------|-------|
-| GPUVerify | Verified (DRF) | ❌ False Negative | Not a race — algorithmic bug outside tool scope |
-| Faial | DRF | ❌ False Negative | Same — not a race, both tools correctly report DRF |
+| GPUVerify | Verified (DRF) | ❌ False Negative | Algorithmic bug — not a sync race |
+| Faial | DRF | ❌ False Negative | Algorithmic bug — not a sync race |
+| Weft | No races detected | ❌ False Negative | Algorithmic bug — not a sync race; 195 race tests performed, all clean |

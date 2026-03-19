@@ -83,6 +83,14 @@ shared across all threads. The CSE pass was not designed for concurrent use.
 | Classification | ⚪ Not Applicable |
 | Reason | Faial analyzes CUDA GPU kernels only. This is a C++ thread race on a static `ComputationCache` inside TVM's compiler pipeline. No CUDA kernel is generated or involved. |
 
+### Weft
+
+| Property | Value |
+|----------|-------|
+| Result | **NOT APPLICABLE** |
+| Classification | ⚪ Not Applicable |
+| Reason | Weft analyzes CUDA GPU kernels via PTX files only. This is a C++ compiler-internal race on a static cache — no CUDA kernel or PTX file is generated. Requires 50+ cores to trigger reliably at runtime. |
+
 ---
 
 ## Tool Comparison Summary
@@ -91,3 +99,4 @@ shared across all threads. The CSE pass was not designed for concurrent use.
 |------|--------|----------------|-------|
 | GPUVerify | N/A | ⚪ Not Applicable | C++ compiler race — no CUDA kernel |
 | Faial | N/A | ⚪ Not Applicable | C++ compiler race — no CUDA kernel |
+| Weft | N/A | ⚪ Not Applicable | C++ compiler race — no PTX file to analyze |

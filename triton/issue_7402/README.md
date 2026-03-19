@@ -9,51 +9,35 @@
 ## What is the Bug?
 
 `tl.atomic_add` atomically increments a counter and returns the old value,
-intended as a ticket dispenser where each thread gets a unique write slot:
-```python
-write_index = tl.atomic_add(index_ptr + tl.arange(0, 1), val=1, sem="relaxed")
-tl.store(out_ptr + write_index[:, None] * 8 + tl.arange(0, 8)[None, :], ...)
+intended as a ticket dispenser where each thread gets a unique write slot.
+Due to a layout mismatch in Triton 3.0.0, only thread 0 receives the correct
+atomic return value; all other 127 threads receive 0. All non-zero threads
+then write to `out[0, :]`, corrupting that row — a WAW race.
+
+## Results
+
+### Expected output:
+```
+Result  : [[0, 0, 0, 0, 0, 0, 0, 0], [2, 2, 2, 2, 2, 2, 2, 2]]
 ```
 
-With `index[0] = 1`, the expected return from `atomic_add` is `1` for all
-threads, so all threads should write to `out[1, :]`. Instead:
-
-- Thread 0 gets the correct return value (`1`) and writes to `out[1, :]`
-- All other threads get `0` and write to `out[0, :]`, corrupting that row
-
-The root cause is a layout mismatch: `tt.atomic_rmw` produces its result in
-`#blocked` layout with `sizePerThread = [1]` across 128 threads (4 warps x
-32), but the tensor only has 1 element. Only thread 0 holds the real atomic
-return value; the remaining 127 threads hold 0. The subsequent
-`triton_gpu.convert_layout` spreads this incorrect state rather than
-broadcasting thread 0's value to all threads. PR #7460 fixed the atomic RMW
-lowering to properly broadcast the return value to all participating threads.
+### Buggy output (Triton 3.0.0):
+```
+Result  : [[0, 2, 2, 2, 2, 2, 2, 2], [2, 0, 0, 0, 0, 0, 0, 0]]
+BUG CONFIRMED: only thread 0 gets correct atomic_add return value
+```
 
 ## Requirements
 
 - Python 3.10+
 - CUDA 12.x
 - Any NVIDIA GPU
-- **Triton 3.0.0** (bug is fixed in 3.1.0+)
-
-## Setup
-```bash
-conda create -n triton-7402 python=3.12 -y
-conda activate triton-7402
-pip install torch==2.4.0
-pip install triton==3.0.0
-```
+- Triton 3.0.0 (bug is fixed in 3.1.0+)
 
 ## How to Run
+
 ```bash
 python reproduce.py
-```
-
-## Expected Output (bug firing on Triton 3.0.0)
-```
-Result  : [[0, 2, 2, 2, 2, 2, 2, 2], [2, 0, 0, 0, 0, 0, 0, 0]]
-Expected: [[0, 0, 0, 0, 0, 0, 0, 0], [2, 2, 2, 2, 2, 2, 2, 2]]
-BUG CONFIRMED: tl.atomic_add return value is wrong across threads
 ```
 
 ---
@@ -64,9 +48,10 @@ BUG CONFIRMED: tl.atomic_add return value is wrong across threads
 
 | Property | Value |
 |----------|-------|
-| Result | **RACE DETECTED — 1 error** |
+| Result | **RACE DETECTED** |
 | Classification | ✅ True Positive |
-| Race Type | WAW race on global memory `out[0]` |
+| Race Type | WAW race on global memory (`out[0]`) |
+| Errors | 1 |
 
 GPUVerify output:
 ```
@@ -76,14 +61,16 @@ error: possible write-write race on out[0]:
 GPUVerify kernel analyser finished with 0 verified, 1 error
 ```
 
+GPUVerify detected the race because it can reason about global memory
+accesses and determined that both threads compute `write_index = 0`.
+
 ### Faial
 
 | Property | Value |
 |----------|-------|
 | Result | **DRF (Data-Race Free)** |
 | Classification | ❌ False Negative |
-| Race Type Missed | WAW race on global memory `out[write_index * 8 + i]` |
-| Faial Version | faial-drf (built from source, gitlab.com/umb-svl/faial) |
+| Race Type Missed | WAW race on global memory (data-dependent write index) |
 | Command | `faial-drf --cu-to-json=/usr/local/bin/cu-to-json kernel_clean.cu` |
 
 Faial output:
@@ -91,42 +78,57 @@ Faial output:
 Kernel 'atomic_add_buggy' is DRF!
 ```
 
-#### Why Faial Missed This Bug
+Faial missed the race because `write_index` is treated as an unconstrained
+symbolic variable in its memory access protocol. Faial cannot derive the
+runtime constraint that threads 1-127 all receive `write_index=0` due to
+Triton's broken layout — that information is only known at runtime.
 
-Inspection of Faial's memory access protocol (`--show-map`) reveals the
-root cause:
+### Weft
 
+| Property | Value |
+|----------|-------|
+| Result | **No races detected** |
+| Classification | ❌ False Negative |
+| Race Type Missed | WAW race on global memory |
+| Weft Version | Built from source (github.com/lightsighter/Weft) |
+| Command | `weft -f kernel_clean.ptx -t 4 -i -d` |
+| PTX Compiled With | `nvcc -ptx kernel_weft.cu` (added `__launch_bounds__(128)`) |
+
+Weft output:
 ```
-int write_index1;   <- treated as unconstrained symbolic variable
-foreach (i in 0..7) {
-    rw(2) out[(write_index1 * 8) + i]
-}
+WEFT INFO: No deadlocks detected in kernel atomic_add_buggy!
+WEFT INFO: No races detected in kernel atomic_add_buggy!
+WEFT STATISTICS for Kernel atomic_add_buggy
+  CTA Thread Count:                      128
+  Shared Memory Locations:                 0
+  Physical Named Barriers;                 1
+  Dynamic Barrier Instances:               0
+  Weft Statements:                         0
+  Total Race Tests:                        0
 ```
 
-Faial abstracted `write_index` as a **free symbolic variable** with no
-constraints on its value. Since two threads can have different values of
-`write_index1`, Faial concludes they may write to **different** memory
-locations — and therefore sees no race.
+#### Why Weft Missed This Bug
 
-The actual bug is that at runtime, threads 1-127 all receive `write_index=0`
-due to the layout mismatch in Triton's atomic return value broadcasting.
-This is a **runtime value constraint** — the race only exists because the
-layout bug forces all non-zero threads to have the same index value.
+The race in issue #7402 is a **global memory race** — all 128 threads write
+to `out[write_index * ROW_WIDTH + i]` which is a global memory array.
+Weft only analyzes shared memory (`ld.shared`/`st.shared` in PTX) and has
+no visibility into global memory accesses whatsoever.
 
-Faial cannot reason about this because:
-1. `write_index` is initialized from `atomicAdd` which Faial models as a
-   non-deterministic value (correctly — atomics return different values in
-   general)
-2. The constraint that "threads 1-127 all get 0 due to the layout bug"
-   is a property of Triton's specific broken lowering, not something
-   derivable from the CUDA kernel structure alone
-3. This is similar to the `(CIDD)` data-dependent index case in issue
-   #4233, except here Faial doesn't even flag a potential alarm because
-   there's no structural evidence that the indices must collide
+`Shared Memory Locations: 0` and `Total Race Tests: 0` confirm that Weft
+found nothing to analyze in this kernel — the same fundamental scope
+limitation seen in issue #4233.
 
-This is a **fundamental limitation** of symbolic analysis with
-unconstrained input variables — the race is only detectable if the
-analyzer knows the specific runtime constraint imposed by the Triton bug.
+#### Comparing Weft vs Faial on This Issue
+
+Both Weft and Faial missed this race, but for completely different reasons:
+- **Weft** missed it because the race is on global memory — entirely outside
+  Weft's shared-memory-only scope.
+- **Faial** missed it because `write_index` becomes an unconstrained symbolic
+  variable in its analysis — it cannot derive the runtime constraint that
+  all non-zero threads receive index 0 due to Triton's layout bug.
+
+Only GPUVerify caught this race, by reasoning about global memory accesses
+and concretely evaluating the thread-dependent write index.
 
 ---
 
@@ -134,5 +136,6 @@ analyzer knows the specific runtime constraint imposed by the Triton bug.
 
 | Tool | Result | Classification | Notes |
 |------|--------|----------------|-------|
-| GPUVerify | RACE DETECTED (1 error) | ✅ True Positive | Detected WAW on out[0] |
+| GPUVerify | RACE DETECTED | ✅ True Positive | Global memory WAW race detected |
 | Faial | DRF | ❌ False Negative | `write_index` treated as unconstrained symbolic variable |
+| Weft | No races detected | ❌ False Negative | Global memory race — outside Weft's shared-memory-only scope |

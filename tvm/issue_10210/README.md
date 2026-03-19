@@ -80,6 +80,14 @@ output element.
 | Classification | ⚪ Not Applicable |
 | Reason | Faial analyzes CUDA GPU kernels only. This is a CPU thread race where multiple OS threads write to the same accumulator `C[i][j]` without synchronisation. No CUDA kernel is involved. |
 
+### Weft
+
+| Property | Value |
+|----------|-------|
+| Result | **NOT APPLICABLE** |
+| Classification | ⚪ Not Applicable |
+| Reason | Weft analyzes CUDA GPU kernels via PTX files only. This is a CPU thread pool race where OS threads write to the same accumulator without synchronisation. No CUDA kernel or PTX file is generated for this bug. |
+
 ---
 
 ## Tool Comparison Summary
@@ -88,3 +96,4 @@ output element.
 |------|--------|----------------|-------|
 | GPUVerify | N/A | ⚪ Not Applicable | CPU race — no CUDA kernel |
 | Faial | N/A | ⚪ Not Applicable | CPU race — no CUDA kernel |
+| Weft | N/A | ⚪ Not Applicable | CPU race — no PTX file to analyze |

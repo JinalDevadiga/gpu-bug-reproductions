@@ -152,6 +152,51 @@ analysis scope, which does not track shared memory state across loop iterations.
 This is a **known limitation** of Faial's design — it is sound within a single
 barrier-phase but does not reason about multi-iteration pipeline overlaps.
 
+### Weft
+
+| Property | Value |
+|----------|-------|
+| Result | **No races detected** |
+| Classification | ❌ False Negative |
+| Race Type Missed | Cross-iteration Write-After-Read (WAR) hazard |
+| Weft Version | Built from source (github.com/lightsighter/Weft) |
+| Command | `weft -f kernel_clean.ptx -t 4 -i -d` |
+| PTX Compiled With | `nvcc -ptx kernel_weft.cu` (added `__launch_bounds__(1024)`) |
+
+Weft output:
+```
+WEFT INFO: No deadlocks detected in kernel main_kernel!
+WEFT INFO: Barriers properly recycled in kernel main_kernel!
+WEFT INFO: No races detected in kernel main_kernel!
+WEFT STATISTICS for Kernel main_kernel
+  CTA Thread Count:                     1024
+  Shared Memory Locations:           1576960
+  Physical Named Barriers;                 1
+  Dynamic Barrier Instances:             508
+  Total Race Tests:                  2068480
+```
+
+#### Why Weft Missed This Bug
+
+Weft performs **happens-before analysis** over a flat, fully unrolled trace of
+all thread instructions. It checks whether every conflicting pair of shared
+memory accesses (same address, at least one write) is ordered by a barrier.
+
+Within any single unrolled pass through the loop body, the write targets slot
+`(ko+2)%3` and the read targets slot `(ko%3)` — these are always different
+addresses within the same iteration, so Weft sees no conflict. The aliasing
+only occurs across iterations: the slot written in iteration `ko` becomes the
+slot read in iteration `ko+2`. This inter-iteration value dependency — that
+`(ko+2)%3` eventually equals `ko%3` for a later `ko` — is a property of the
+modulo arithmetic over the loop variable that Weft's barrier dependence graph
+cannot encode.
+
+Weft's analysis is also specifically designed for **named barrier** semantics
+(`bar.sync`/`bar.arrive` in PTX). The `__syncthreads()` in this kernel compiles
+to a simple `bar.sync 0` with all threads — the synchronization structure
+Weft sees is correct within each iteration. The bug is in the pipeline staging
+logic across iterations, which is outside Weft's verification scope.
+
 ---
 
 ## Tool Comparison Summary
@@ -160,3 +205,4 @@ barrier-phase but does not reason about multi-iteration pipeline overlaps.
 |------|--------|----------------|-------|
 | GPUVerify | RACE DETECTED | ✅ True Positive | Detected write-write race in simplified kernel |
 | Faial | DRF | ❌ False Negative | Cannot reason across loop iterations |
+| Weft | No races detected | ❌ False Negative | Cannot reason across loop iterations; named-barrier focus |

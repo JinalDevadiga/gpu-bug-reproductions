@@ -77,6 +77,14 @@ regardless of whether they were inside a parallel loop.
 | Classification | ⚪ Not Applicable |
 | Reason | Faial analyzes CUDA GPU kernels only. This is a CPU thread race in TVM's runtime (`tvm_stack_alloca` shared across OS threads). No CUDA kernel is generated for this bug. |
 
+### Weft
+
+| Property | Value |
+|----------|-------|
+| Result | **NOT APPLICABLE** |
+| Classification | ⚪ Not Applicable |
+| Reason | Weft analyzes CUDA GPU kernels via PTX files only. This is a CPU-level race in TVM's parallel thread pool — no CUDA kernel is generated for this bug. No PTX file exists to analyze. |
+
 ---
 
 ## Tool Comparison Summary
@@ -85,3 +93,4 @@ regardless of whether they were inside a parallel loop.
 |------|--------|----------------|-------|
 | GPUVerify | N/A | ⚪ Not Applicable | CPU race — no CUDA kernel |
 | Faial | N/A | ⚪ Not Applicable | CPU race — no CUDA kernel |
+| Weft | N/A | ⚪ Not Applicable | CPU race — no PTX file to analyze |

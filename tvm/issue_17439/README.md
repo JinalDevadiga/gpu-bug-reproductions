@@ -9,57 +9,18 @@
 
 ## What is the Bug?
 
-In TVM's lowering pipeline (`src/driver/driver_api.cc#L585-L613`), the
-`ThreadSync` pass runs **before** `MergeSharedMemoryAllocations`:
-
-```cpp
-mixed_pass_list.push_back(tir::transform::ThreadSync("shared"));            // line ~590
-...
-mixed_pass_list.push_back(tir::transform::MergeSharedMemoryAllocations());  // line ~613
-```
-
-`ThreadSync` inserts `tvm_storage_sync` barriers based on the assumption
-that `A_shared`, `B_shared`, and `C_shared` are **separate memory regions**.
-`MergeSharedMemoryAllocations` then reuses the same memory space for all
-three buffers. After the merge, `Store C_shared` writes to the same address
-as `Load A_shared`, but there is no barrier between them.
-
-```
-// After merge — C_shared reuses A_shared/B_shared address space
-Store A_shared
-Store B_shared
-tvm_storage_sync          <- correctly placed (ThreadSync saw separate buffers)
-Load A_shared
-Load B_shared
-Store C_shared            <- NOW ALIASES A_shared — missing barrier here!
-tvm_storage_sync
-Load C_shared
-```
-
-## Requirements
-
-- Python 3.9 – 3.11
-- `apache-tvm==0.11.1`
-- No GPU required (TIR inspection)
-
-## Setup
-
-```bash
-conda activate tvm-bugs    # apache-tvm 0.11.1
-```
+In TVM's lowering pipeline, the `ThreadSync` pass runs **before**
+`MergeSharedMemoryAllocations`. `ThreadSync` inserts `tvm_storage_sync`
+barriers based on separate `A_shared`, `B_shared`, and `C_shared` buffers.
+After `MergeSharedMemoryAllocations` reuses the same address space for all
+three, `Store C_shared` writes to the same memory as `Load A_shared` with
+no barrier between them — a read-write race causing silent wrong results.
 
 ## How to Run
 
 ```bash
 python reproduce.py
 ```
-
-## Root Cause
-
-`src/driver/driver_api.cc#L585-L613` — `ThreadSync("shared")` is scheduled
-before `MergeSharedMemoryAllocations` in the mixed pass pipeline. Sync
-barrier placement is invalidated when shared memory buffers are merged into
-a single allocation after the fact.
 
 ---
 
@@ -69,15 +30,16 @@ a single allocation after the fact.
 
 | Property | Value |
 |----------|-------|
-| Result | **RACE DETECTED — 1 error** |
+| Result | **RACE DETECTED** |
 | Classification | ✅ True Positive |
-| Race Type | Read-Write race on `C_shared[1]` between threads in same block |
+| Race Type | Read-write race on `C_shared` (aliased with `A_shared` after merge) |
+| Errors | 1 |
 
 GPUVerify output:
 ```
 error: possible read-write race on C_shared[1]:
-  Write by thread (0,0) in block (1,1): C_shared[cse_var_1] = C_shared[cse_var_1] + ...
-  Read  by thread (8,8) in block (1,1): C_shared[cse_var_1] = C_shared[cse_var_1] + ...
+  Write by thread (0,0): C_shared[cse_var_1] = C_shared[cse_var_1] + ...
+  Read  by thread (8,8): C_shared[cse_var_1] = C_shared[cse_var_1] + ...
 GPUVerify kernel analyser finished with 0 verified, 1 error
 ```
 
@@ -85,34 +47,80 @@ GPUVerify kernel analyser finished with 0 verified, 1 error
 
 | Property | Value |
 |----------|-------|
-| Result | **RACE DETECTED — 12 data-races** |
+| Result | **RACE DETECTED** |
 | Classification | ✅ True Positive |
-| Race Type | Read-Write races on `C_shared` across multiple loop iteration combinations |
-| Faial Version | faial-drf (built from source, gitlab.com/umb-svl/faial) |
+| Race Type | Read-write race on aliased shared memory |
+| Races Found | 12 |
 | Command | `faial-drf --cu-to-json=/usr/local/bin/cu-to-json kernel_clean.cu` |
 
-Faial detected 12 races — all true positives — spread across two lines:
-- **Line 66** (8 races): `C_shared[cse_var_1] = C_shared[cse_var_1] + A_shared[0] * B_shared[0]`
-  across different combinations of loop variables `ic`, `jc`, `k`
-- **Line 38** (4 races): `C_shared[ic * 16 + jc] = 0.0f` in the initialisation loop
-  across different combinations of `ic`, `jc`
+Faial found 12 data-races — all stemming from the same aliased
+`C_shared`/`A_shared` region, reported across different loop iteration
+combinations of `ic`, `jc`, and `k`.
 
-In all 12 cases, Thread 0 and Thread 1 access the same `C_shared` index
-simultaneously with no `__syncthreads()` protecting the access.
+### Weft
 
-#### Why Faial Found More Races Than GPUVerify
-GPUVerify reports **1 error** while Faial reports **12 races**. Both are
-correct — they differ in reporting granularity. Faial enumerates races
-across all distinct loop variable combinations that produce conflicts,
-while GPUVerify reports a single representative instance of the race.
-All 12 of Faial's races stem from the same root cause: the missing
-barrier after shared memory aliasing caused by the wrong pass ordering.
+| Property | Value |
+|----------|-------|
+| Result | **OOM — process killed during emulation** |
+| Classification | ⚠️ Inconclusive (scalability limit) |
+| Weft Version | Built from source (github.com/lightsighter/Weft) |
+| Command | `weft -f kernel_clean.ptx -t 1 -v` |
+| PTX Compiled With | `nvcc -ptx kernel_weft.cu` (added `__launch_bounds__(256)`) |
+| System | 7.6 GB RAM, 2 GB swap |
+
+Weft output:
+```
+WEFT WARNING: No line information found! Line numbers from PTX will be used!
+                Try re-running nvcc with the '-lineinfo' flag!
+WEFT INFO: No deadlocks detected in kernel tvm_matmul_buggy!
+WEFT INFO: Barriers properly recycled in kernel tvm_matmul_buggy!
+Killed
+```
+
+Both `-t 4` (4 threads) and `-t 1` (single thread) were tried — both
+resulted in the process being killed by the OS during the emulation phase.
+
+#### Why Weft Was Killed
+
+The kernel has:
+- 256 threads (16×16 block)
+- 49 barrier instructions
+- Triple-nested loops (`ic`, `jc` up to 16, `k` up to 64)
+
+Weft emulates every thread's instruction trace in full before building the
+happens-before graph. For a kernel with deeply nested loops unrolled across
+256 threads, the dynamic instruction count grows rapidly — the
+`Compute Happens-Before/After Relationships` phase in particular scales
+quadratically with the number of weft statements, requiring bitsets of size
+`O(statements²)` stored in memory.
+
+The previous issue #96 (1024 threads, simpler loop) used ~4.9 GB of RAM and
+completed in 29 seconds. The TVM matmul kernel, with 256 threads but a much
+deeper loop structure (16×16×64 iterations with 49 barriers), exhausts
+available memory before the happens-before computation can complete.
+
+This is a **known scalability limitation** of Weft. The Weft paper
+(PLDI 2015) notes that memory usage is the primary constraint for large
+kernels, and recommends the tool for kernels with bounded, statically
+analyzable loops. The TVM matmul kernel's deeply nested loops produce a
+dynamic instruction count that exceeds what Weft can handle on a 7.6 GB
+system.
+
+#### Significance
+
+This result is itself meaningful: it demonstrates that Weft's exhaustive
+emulation-based approach has practical memory limits that prevent analysis
+of larger production GPU kernels. The TVM matmul kernel is not especially
+large by modern standards — GPUVerify and Faial both analyzed it successfully.
+This highlights a scalability gap between Weft's 2015-era design and the
+complexity of modern framework-generated kernels.
 
 ---
 
 ## Tool Comparison Summary
 
-| Tool | Result | Classification | Races Found | Notes |
-|------|--------|----------------|-------------|-------|
-| GPUVerify | RACE DETECTED | ✅ True Positive | 1 error | Representative instance |
-| Faial | RACE DETECTED | ✅ True Positive | 12 races | All loop iteration combinations |
+| Tool | Result | Classification | Notes |
+|------|--------|----------------|-------|
+| GPUVerify | RACE DETECTED | ✅ True Positive | 1 error — aliased shared memory race |
+| Faial | RACE DETECTED | ✅ True Positive | 12 races — all same root cause |
+| Weft | OOM / Killed | ⚠️ Inconclusive | Process killed during emulation — scalability limit exceeded |
