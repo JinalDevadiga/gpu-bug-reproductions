@@ -34,7 +34,9 @@ def run_gemm(parallel_reduction: bool):
     s = te.create_schedule(C_t.op)
     if parallel_reduction:
         s[C_t].parallel(C_t.op.reduce_axis[0])   # <- the bug trigger
-    func = tvm.build(s, [A_t, B_t, C_t], target="llvm")
+    # func = tvm.build(s, [A_t, B_t, C_t], target="llvm")
+    func = tvm.build(s, [A_t, B_t, C_t], target="cuda")
+
     A_nd = tvm.nd.array(A_np, dev)
     B_nd = tvm.nd.array(B_np, dev)
     C_nd = tvm.nd.array(np.zeros((M, N), dtype="float32"), dev)

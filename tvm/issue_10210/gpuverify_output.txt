@@ -1,0 +1,20 @@
+GPUVerify Analysis — TVM issue #10210
+======================================
+Command:
+  python GPUVerify.py --cuda --blockDim=64 --gridDim=1 kernel_clean.cu
+
+Output:
+  warning: Assuming the arguments 'C', 'A', 'B' of 'parallel_reduction_buggy'
+  to be non-aliased; please consider adding a restrict qualifier.
+
+  error: possible read-write race on C[0]:
+    Write by thread 0 (global id 0): C[i*64+j] = C[i*64+j] + A[i*64+k] * B[k*64+j];
+    Read  by thread 1 (global id 1): C[i*64+j] = C[i*64+j] + A[i*64+k] * B[k*64+j];
+
+  error: possible write-write race on C[0]:
+    Write by thread 0 (global id 0): C[i*64+j] = C[i*64+j] + A[i*64+k] * B[k*64+j];
+    Write by thread 1 (global id 1): C[i*64+j] = C[i*64+j] + A[i*64+k] * B[k*64+j];
+
+  GPUVerify kernel analyser finished with 0 verified, 2 errors
+
+Status: RACE DETECTED — 2 errors
