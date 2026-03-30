@@ -63,6 +63,7 @@ mbarrier.wait.parity.shared::cta.b64 ...        // wait for TMA completion
 ---
 
 ## Key Pattern in Generated CUDA Code
+
 ```c
 // Step 1: T.clear(B_shared) — zero shared memory
 *(uint4*)(buf_dyn_shmem + ...) = make_uint4(0, 0, 0, 0);
@@ -112,6 +113,7 @@ Note: The incorrect numerical output could not be observed on this setup
 (no H100), but the buggy CUDA code pattern is confirmed via reproduce.py.
 
 ## Setup
+
 ```bash
 conda create -n tilelang-bugs python=3.12 -y
 conda activate tilelang-bugs
@@ -120,6 +122,7 @@ pip install tilelang==0.1.8
 ```
 
 ## How to Run
+
 ```bash
 python reproduce.py
 ```
@@ -139,30 +142,20 @@ tl::mma_sync(...)
 
 GPUVerify, Faial, and Weft **cannot parse these headers or primitives** —
 they are TileLang-internal and not standard CUDA. Therefore we wrote a
-simplified `kernel_clean.cu` that:
-- Captures the same synchronization structure (clear → sync → pipeline)
-- Uses standard CUDA (no TileLang headers)
-- Is compilable by all three tools
+simplified `kernel_clean.cu` that captures the same synchronization structure
+(clear → sync → 3-stage pipeline) using standard CUDA without TileLang
+dependencies.
 
 ---
 
 ## PTX Analysis (-arch=sm_90)
 
-We compiled `kernel_clean.cu` with `-arch=sm_90` to inspect the PTX:
-```bash
-nvcc -arch=sm_90 -ptx kernel_clean.cu -o kernel_sm90.ptx
-```
-
-The PTX shows only standard instructions even when targeting sm_90:
-```ptx
-.target sm_90          <- compiled for H100 architecture
-bar.sync 0             <- standard __syncthreads() — NOT mbarrier
-st.shared.u32          <- standard shared memory store
-ld.global.nc.f32       <- standard global load — NOT cp.async.bulk.tensor
-```
-
-**No TMA instructions appear** — confirming our simplified kernel cannot
-model the H100 race regardless of compilation target.
+We compiled `kernel_clean.cu` with `-arch=sm_90` and confirmed the PTX
+only contains standard `bar.sync` instructions — no TMA
+(`cp.async.bulk.tensor`) or `mbarrier` instructions appear. This proves our
+simplified kernel cannot model the H100 race regardless of compilation
+target — TMA instructions only appear when explicitly used in code (as
+TileLang does internally).
 
 ---
 
@@ -224,24 +217,17 @@ True alarm detected!
 
 Faial detected 2 races — but these are **NOT the original H100 TMA bug**.
 They are introduced by a sizing mistake in our simplified kernel:
+`STAGE_SIZE = 4` and `BLOCK_SIZE = 4` causes stage boundaries to alias
+(Thread 4 writes `buf_dyn_shmem[4]` via stage 0, Thread 0 writes
+`buf_dyn_shmem[4]` via stage 1 — same address). In the real kernel,
+`STAGE_SIZE = 4096` and `BLOCK_SIZE = 128` — stages never alias.
 
-- We used `STAGE_SIZE = 4` and `BLOCK_SIZE = 4`
-- Stage 0 occupies indices `0..3`, Stage 1 occupies indices `4..7`
-- Thread 4 writes `buf_dyn_shmem[0 * 4 + 4] = buf_dyn_shmem[4]` (stage 0)
-- Thread 0 writes `buf_dyn_shmem[1 * 4 + 0] = buf_dyn_shmem[4]` (stage 1)
-- Both write to **the same index 4** — a race caused by our simplification
+Faial's SMT solver (Z3) correctly solved the index equation `0*4+4 = 1*4+0`
+and found the aliasing, while GPUVerify's theorem prover missed it. This
+shows Faial is more precise at index arithmetic — but the races found are
+simplification artifacts, not the original bug.
 
-In the real kernel, `STAGE_SIZE = 4096` and `BLOCK_SIZE = 128` — stages
-never alias. Our simplified kernel accidentally created aliasing by making
-`STAGE_SIZE == BLOCK_SIZE`.
-
-This also reveals an important difference between GPUVerify and Faial:
-- **GPUVerify** uses theorem proving — it proved the simplified kernel safe
-  for all thread orderings, missing the stage aliasing
-- **Faial** uses SMT solving — Z3 solved the equation `0*4+4 = 1*4+0`
-  and found the aliasing, showing Faial is more precise at index arithmetic
-
-However, **the original H100 TMA race is still not detected by either tool**.
+**The original H100 TMA race is still not detected by any tool.**
 
 ### Weft
 
@@ -250,10 +236,50 @@ However, **the original H100 TMA race is still not detected by either tool**.
 | Result | **No races detected** |
 | Classification | ❌ False Negative |
 | Race Type Missed | H100 TMA async pipeline race |
+| Weft Version | Built from source (github.com/lightsighter/Weft) |
+| Command | `weft -f kernel_clean.ptx -t 4 -i -d` |
+| PTX Compiled With | `nvcc -ptx kernel_weft.cu` (added `__launch_bounds__(4)`) |
 
-Weft was built in 2015 — `mbarrier` did not exist until H100 (2022).
-Weft has no model for TMA async operations. Same three reasons apply as
-GPUVerify: cannot parse real kernel, simplified kernel race-free, no TMA model.
+Weft output:
+```
+WEFT INFO: No deadlocks detected in kernel main_kernel!
+WEFT INFO: Barriers properly recycled in kernel main_kernel!
+WEFT INFO: No races detected in kernel main_kernel!
+WEFT STATISTICS for Kernel main_kernel
+  CTA Thread Count:                        4
+  Shared Memory Locations:                12
+  Physical Named Barriers;                 1
+  Dynamic Barrier Instances:               7
+  Weft Statements:                        72
+  Total Race Tests:                       60
+```
+
+#### Why Weft Missed This Bug
+
+Unlike GPUVerify which proved the simplified kernel safe, Weft fully
+analyzed the shared memory — 12 locations, 60 race tests across 7 barrier
+instances. Weft found no races because the simplified kernel is genuinely
+race-free for standard loads. Three compounding reasons:
+
+1. **Cannot parse real kernel** — TileLang headers incompatible with Weft;
+   simplified kernel uses standard loads where `__syncthreads()` IS sufficient
+
+2. **No TMA model** — Weft was built in 2015. The H100 `mbarrier` primitive
+   was introduced in 2022. Weft has no knowledge of TMA async operations
+
+3. **Named barriers vs mbarrier** — Weft was designed for **named barrier**
+   verification (`bar.sync N` / `bar.arrive N`), not TMA hardware sync:
+
+| Barrier Type | Weft Can Detect? | Purpose |
+|-------------|-----------------|---------|
+| `__syncthreads()` (`bar.sync 0`) | ✅ Yes | Thread sync |
+| Named barriers (`bar.sync N`) | ✅ Yes | Warp group sync — Weft's primary purpose |
+| `mbarrier` (TMA async) | ❌ No | TMA hardware sync — H100-specific, 2022 |
+
+Note: Weft did NOT find the spurious races that Faial found — Weft's
+happens-before analysis is not sensitive to the STAGE_SIZE aliasing
+artifact because it reasons about concrete instruction ordering rather
+than symbolic index arithmetic.
 
 ---
 
@@ -262,15 +288,12 @@ GPUVerify: cannot parse real kernel, simplified kernel race-free, no TMA model.
 | Tool | Result | Classification | Notes |
 |------|--------|----------------|-------|
 | GPUVerify | Verified (DRF) | ❌ False Negative | Proved simplified kernel safe; no TMA model |
-| Faial | 2 races (spurious) | ❌ FN for original bug | Races are simplification artifacts (STAGE_SIZE==BLOCK_SIZE aliasing); original H100 TMA race not detected |
-| Weft | No races detected | ❌ False Negative | No mbarrier model; simplified kernel race-free |
+| Faial | 2 races (spurious) | ❌ FN for original bug | Races are simplification artifacts (STAGE_SIZE==BLOCK_SIZE aliasing); H100 TMA race not detected |
+| Weft | No races detected | ❌ False Negative | 60 race tests performed; simplified kernel race-free; no mbarrier model |
 
 ## Key Takeaway
 
 All three tools give **False Negative for the original H100 TMA race**
 because the race operates at the hardware level — between TMA engine and
 CUDA threads — below what any static thread-level tool can reason about.
-Faial uniquely found races in our simplified kernel due to its more precise
-SMT-based index arithmetic, but these are simplification artifacts unrelated
-to the original bug. Runtime confirmation requires actual H100 hardware
-where ~79.3% of output values are wrong.
+Runtime confirmation requires actual H100 hardware (~79.3% wrong output).
