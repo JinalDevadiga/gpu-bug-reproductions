@@ -115,7 +115,7 @@ nvcc -ptx your_kernel.cu -o your_kernel.ptx
 | Issue | Bug Description | Reproduced? | GPUVerify | Faial | Weft |
 |-------|----------------|-------------|-----------|-------|------|
 | #96   | Race in pipelined matmul (shared memory reuse) | ✅ | RACE DETECTED ✅ TP | DRF ❌ FN | No races ❌ FN |
-| #666  | Shared memory clear before pipelined loops (H100-specific) | ✅ | Verified ❌ FN | DRF ❌ FN | No races ❌ FN |
+| #666  | Shared memory clear before pipelined loops (H100-specific) | ✅ | Verified ❌ FN | Spurious races ❌ FN | No races ❌ FN |
 | #1257 | Missing `__syncthreads()` after AtomicAdd | ✅ | RACE DETECTED ✅ TP | RACE DETECTED ✅ TP | RACES DETECTED ✅ TP |
 | #1671 | Python `and`/`or` on TVM Expr (compile-time crash) | ❌ version unavailable | N/A ⚪ | DRF ⚪ | No races ⚪ |
 
@@ -135,7 +135,7 @@ nvcc -ptx your_kernel.cu -o your_kernel.ptx
 | Issue | Bug Description | Reproduced? | GPUVerify | Faial | Weft |
 |-------|----------------|-------------|-----------|-------|------|
 | #7246  | `call_packed` race under parallel schedule (CPU) | ❌ version unavailable | N/A ⚪ | N/A ⚪ | N/A ⚪ |
-| #10210 | Parallel reduction axis WAW race (CPU) | ✅ max error 31.21 | N/A ⚪ | N/A ⚪ | N/A ⚪ |
+| #10210 | Parallel reduction axis WAW race (CPU — modelled as CUDA) | ✅ max error 31.21 + CUDA model | RACE DETECTED ✅ TP | RACE DETECTED ✅ TP | N/A ⚪ |
 | #17072 | CSE pass static cache race (needs 50+ cores) | ❌ hardware insufficient | N/A ⚪ | N/A ⚪ | N/A ⚪ |
 | #17439 | `ThreadSync` before `MergeSharedMemory` — missing barrier | ✅ TIR + GPUVerify | RACE DETECTED ✅ TP | RACE DETECTED ✅ TP | OOM ⚠️ |
 
@@ -149,8 +149,8 @@ nvcc -ptx your_kernel.cu -o your_kernel.ptx
 |-----------|--------------|----------------|----------------|-------|
 | TileLang  | 2 | 1 | 1 | 4 |
 | Triton    | 5 | 1 | 0 | 6 |
-| TVM       | 1 | 0 | 3 | 4 |
-| **Total** | **8** | **2** | **4** | **14** |
+| TVM       | 2 | 0 | 2 | 4 |
+| **Total** | **9** | **2** | **3** | **14** |
 
 ### Faial
 
@@ -158,8 +158,8 @@ nvcc -ptx your_kernel.cu -o your_kernel.ptx
 |-----------|--------------|----------------|----------------|-------|
 | TileLang  | 1 | 2 | 1 | 4 |
 | Triton    | 4 | 2 | 0 | 6 |
-| TVM       | 1 | 0 | 3 | 4 |
-| **Total** | **6** | **4** | **4** | **14** |
+| TVM       | 2 | 0 | 2 | 4 |
+| **Total** | **7** | **4** | **3** | **14** |
 
 ### Weft
 
@@ -175,32 +175,87 @@ nvcc -ptx your_kernel.cu -o your_kernel.ptx
 ## Key Findings
 
 ### GPUVerify
-- Successfully detected races in **8 out of 10 applicable cases** (80%).
-- **2 False Negatives**: TileLang #666 (H100-specific async pipeline race) and Triton #4362 (algorithmic ordering bug, not a race).
-- **4 Not Applicable**: 3 TVM issues are CPU-level races; TileLang #1671 is a compile-time crash.
-- Where Triton/TVM did not generate `.cu` files, kernels were manually translated from Triton IR / TVM TIR.
+- Successfully detected races in **9 out of 11 applicable cases** (82%).
+- **2 False Negatives**:
+  - **TileLang #666**: H100-specific async pipeline race — GPUVerify has no
+    model for TMA hardware or `mbarrier`. Real kernel uses TileLang headers
+    GPUVerify cannot parse. Simplified kernel is genuinely race-free because
+    `__syncthreads()` is sufficient for standard loads.
+  - **Triton #4362**: Algorithmic ordering bug — not a data race. Each thread
+    accesses distinct memory with proper barriers. Wrong results come from
+    incorrect scan direction logic, not missing synchronisation.
+- **3 Not Applicable**:
+  - **TileLang #1671**: Compile-time crash — no CUDA kernel generated.
+  - **TVM #7246**: CPU-level race — no CUDA kernel generated, buggy version
+    unavailable on PyPI.
+  - **TVM #17072**: CPU-level compiler cache race — no CUDA kernel, requires
+    50+ cores to trigger.
+- **Notable**: TVM #10210 was initially classified as Not Applicable (CPU race,
+  no CUDA kernel generated). After mentor feedback, we manually wrote a CUDA
+  kernel modelling the same race pattern — GPUVerify detected 2 errors,
+  changing the classification to True Positive.
+- Where Triton/TVM did not generate `.cu` files, kernels were manually
+  translated from Triton IR / TVM TIR following mentor guidance.
 
 ### Faial
-- Successfully detected races in **6 out of 10 applicable cases** (60%).
+- Successfully detected races in **7 out of 11 applicable cases** (64%).
 - **4 False Negatives**:
-  - **TileLang #96**: Cross-iteration WAR hazard — Faial's barrier-phase analysis reasons within single loop iterations only.
-  - **TileLang #666**: Hardware async pipeline race (H100-specific) — beyond any static thread-level tool's scope.
+  - **TileLang #96**: Cross-iteration WAR hazard — Faial's barrier-phase
+    analysis reasons within single loop iterations only, cannot track
+    shared memory state across iterations (`(ko+2)%3` slot reuse).
+  - **TileLang #666**: H100 TMA async pipeline race — beyond the scope of
+    any static thread-level tool. Real kernel uses TileLang headers Faial
+    cannot parse. Faial did detect 2 races in the simplified kernel, but
+    these are **simplification artifacts** (stage aliasing caused by
+    `STAGE_SIZE == BLOCK_SIZE` in our simplified kernel) — not the original
+    H100 TMA bug. The detected races do not exist in the real TileLang kernel
+    where `STAGE_SIZE=4096` and `BLOCK_SIZE=128`. This also reveals that
+    Faial's SMT-based index arithmetic is more precise than GPUVerify's
+    theorem proving — GPUVerify missed the same aliasing that Faial caught.
   - **Triton #4362**: Algorithmic ordering bug — not a data race at all.
-  - **Triton #7402**: WAW race from `atomic_add` layout mismatch — `write_index` treated as unconstrained symbolic variable.
-- **Notable strengths**: Automatic bit-vector arithmetic for XOR indices (#1257); CIDD classification for data-dependent races (#4233); 12 races found vs GPUVerify's 1 for TVM #17439.
+  - **Triton #7402**: WAW race from `atomic_add` layout mismatch —
+    `write_index` treated as unconstrained symbolic variable. Faial cannot
+    derive the runtime constraint that all non-zero threads receive index 0
+    due to Triton's layout bug.
+- **Notable**: TVM #10210 was initially classified as Not Applicable (CPU
+  race, no CUDA kernel). After running Faial on the manually written CUDA
+  model, Faial detected 1 race — changing the classification to True Positive.
+- **Other notable strengths**: Automatic bit-vector arithmetic for XOR
+  indices (#1257); CIDD classification for data-dependent races (#4233);
+  12 races found vs GPUVerify's 1 for TVM #17439.
 
 ### Weft
 - Successfully detected races in **1 out of 10 applicable cases** (10%).
-- **1 Inconclusive**: TVM #17439 — process killed (OOM) during emulation of 256-thread deeply nested matmul kernel. Demonstrates Weft's scalability limit on modern production kernels.
+- **1 Inconclusive**: TVM #17439 — process killed (OOM) during emulation
+  of 256-thread deeply nested matmul kernel. Demonstrates Weft's scalability
+  limit on modern production kernels.
 - **8 False Negatives** falling into four distinct categories:
-  - **Cross-iteration address aliasing** (#96, #4736, #7264): Weft's happens-before analysis correctly reasons within each unrolled loop iteration but cannot detect races where shared memory slots alias across iterations. Affects software pipeline and butterfly reduction patterns.
-  - **Global memory scope** (#4233, #7402): Weft only analyzes shared memory (`ld.shared`/`st.shared` in PTX). Races on global memory arrays are completely invisible — `Shared Memory Locations: 0` for both.
-  - **Missing barrier — vacuously safe** (#8311): With `Dynamic Barrier Instances: 0`, Weft's barrier dependence graph is empty. It correctly finds no barrier violations but misses that the absence of any barrier between producer and consumer writes/reads is itself the bug. Weft was designed for named-barrier (`bar.sync`/`bar.arrive`) warp-specialized kernels, not standard `__syncthreads()` kernels with missing synchronization.
-  - **Out-of-scope bugs** (#666, #4362): H100 async pipeline race and algorithmic ordering error — these are also missed by GPUVerify and Faial for the same reasons.
+  - **Cross-iteration address aliasing** (#96, #4736, #7264): Weft's
+    happens-before analysis correctly reasons within each unrolled loop
+    iteration but cannot detect races where shared memory slots alias across
+    iterations. Affects software pipeline and butterfly reduction patterns.
+  - **Global memory scope** (#4233, #7402): Weft only analyzes shared memory
+    (`ld.shared`/`st.shared` in PTX). Races on global memory arrays are
+    completely invisible — `Shared Memory Locations: 0` for both.
+  - **Missing barrier — vacuously safe** (#8311): With
+    `Dynamic Barrier Instances: 0`, Weft's barrier dependence graph is empty.
+    It correctly finds no barrier violations but misses that the absence of
+    any barrier between producer and consumer writes/reads is itself the bug.
+    Weft was designed for named-barrier (`bar.sync`/`bar.arrive`)
+    warp-specialized kernels, not standard `__syncthreads()` kernels with
+    missing synchronisation.
+  - **Out-of-scope bugs** (#666, #4362): H100 async pipeline race and
+    algorithmic ordering error — also missed by GPUVerify and Faial for
+    the same reasons.
 - **Weft-specific findings**:
-  - Required a **one-line source patch** to handle `red.shared.add.u32` PTX instructions emitted by CUDA 12.3 (Weft was built in 2015 for PTX 4.x).
-  - The `--generate-line-info` nvcc flag crashes Weft's parser on modern PTX debug format — PTX must be compiled without it.
-  - Weft's exhaustive emulation approach works well for small, barrier-heavy kernels (e.g. #1257: 64 threads, 1 barrier, completed in 2ms) but hits memory limits on larger production kernels.
+  - Required a **one-line source patch** to handle `red.shared.add.u32`
+    PTX instructions emitted by CUDA 12.3 (Weft was built in 2015 for
+    PTX 4.x).
+  - The `--generate-line-info` nvcc flag crashes Weft's parser on modern
+    PTX debug format — PTX must be compiled without it.
+  - Weft's exhaustive emulation approach works well for small, barrier-heavy
+    kernels (e.g. #1257: 64 threads, 1 barrier, completed in 2ms) but hits
+    memory limits on larger production kernels.
 
 ### Cross-Tool Comparison
 
@@ -213,3 +268,5 @@ nvcc -ptx your_kernel.cu -o your_kernel.ptx
 | Hardware async pipeline races (H100) | ❌ | ❌ | ❌ |
 | Algorithmic ordering bugs | ❌ | ❌ | ❌ |
 | Large nested-loop kernels | ✅ | ✅ | ⚠️ OOM risk |
+| CPU-level races (no CUDA kernel) | ✅ (with manual CUDA model) | ✅ (with manual CUDA model) | ❌ |
+| Index arithmetic precision | Theorem proving | SMT solving (more precise) | PTX happens-before |

@@ -146,24 +146,6 @@ simplified `kernel_clean.cu` that:
 
 ---
 
-## Why the Simplified Kernel is Genuinely Race-Free
-
-Our `kernel_clean.cu` uses **standard loads**:
-```cuda
-buf_dyn_shmem[i * STAGE_SIZE + tid] = 0.0f;     // standard store
-__syncthreads();                                   // sufficient for standard loads
-buf_dyn_shmem[0 * STAGE_SIZE + tid] = A[tid];   // standard load
-```
-
-For standard loads, `__syncthreads()` IS sufficient — threads wait for all
-stores to complete before any loads begin. There is genuinely no race in our
-simplified kernel. All three tools correctly report no races.
-
-The race only happens when TMA is used — which our simplified kernel does
-not use.
-
----
-
 ## PTX Analysis (-arch=sm_90)
 
 We compiled `kernel_clean.cu` with `-arch=sm_90` to inspect the PTX:
@@ -177,23 +159,10 @@ The PTX shows only standard instructions even when targeting sm_90:
 bar.sync 0             <- standard __syncthreads() — NOT mbarrier
 st.shared.u32          <- standard shared memory store
 ld.global.nc.f32       <- standard global load — NOT cp.async.bulk.tensor
-st.shared.f32          <- standard shared memory store
-ld.shared.f32          <- standard shared memory load
 ```
 
-**No TMA instructions appear** — no `cp.async.bulk.tensor`, no `mbarrier`.
-This confirms our simplified kernel cannot model the H100 race regardless
-of compilation target. TMA instructions only appear when explicitly used in
-code (as TileLang does internally).
-
-The real TileLang kernel compiled for sm_90 would show:
-```ptx
-cp.async.bulk.tensor.2d.shared::cluster.global ...  // TMA async load
-mbarrier.arrive.expect_tx.shared::cta.b64 ...       // H100 barrier arrive
-mbarrier.wait.parity.shared::cta.b64 ...            // H100 barrier wait
-```
-These are the instructions that cause the race — and that no existing
-static analysis tool understands.
+**No TMA instructions appear** — confirming our simplified kernel cannot
+model the H100 race regardless of compilation target.
 
 ---
 
@@ -211,7 +180,6 @@ static analysis tool understands.
 GPUVerify output:
 ```
 GPUVerify kernel analyser finished with 1 verified, 0 errors
-Verified: kernel_clean.cu
 - no data races within thread blocks
 - no data races between thread blocks
 - no barrier divergence
@@ -220,43 +188,60 @@ Verified: kernel_clean.cu
 
 #### Why GPUVerify Missed This Bug
 
-Three compounding reasons:
-
-1. **Cannot parse real kernel** — TileLang headers are incompatible with
-   GPUVerify. We had to use a simplified kernel instead.
-
+1. **Cannot parse real kernel** — TileLang headers incompatible with GPUVerify
 2. **Simplified kernel is genuinely race-free** — standard loads with
-   `__syncthreads()` are correctly synchronized. GPUVerify correctly
-   verifies no race exists in our simplified version.
-
-3. **No TMA model** — GPUVerify (2018) has no knowledge of H100's TMA
-   hardware (`cp.async.bulk.tensor`), `mbarrier`, or sm90+ async pipeline
-   semantics. Even if it could parse the real kernel, it could not detect
-   this class of race.
-
-GPUVerify also has no `--arch` flag — it targets sm_35 internally and
-cannot be directed to model sm_90 behavior.
+   `__syncthreads()` are correctly synchronized; GPUVerify proved this correct
+3. **No TMA model** — GPUVerify (2018) has no knowledge of H100 TMA hardware,
+   `cp.async.bulk.tensor`, or `mbarrier`
+4. **No `--arch` flag** — GPUVerify always targets sm_35 internally
 
 ### Faial
 
 | Property | Value |
 |----------|-------|
-| Result | **DRF (Data-Race Free)** |
-| Classification | ❌ False Negative |
-| Race Type Missed | H100 TMA async pipeline race |
+| Result | **RACE DETECTED — 2 data-races** |
+| Classification | ⚠️ Spurious — races are artifacts of simplification, NOT the original H100 TMA bug |
+| Effective classification for original bug | ❌ False Negative |
+| Faial Version | faial-drf (built from source, gitlab.com/umb-svl/faial) |
 | Command | `faial-drf --cu-to-json=/usr/local/bin/cu-to-json kernel_clean.cu` |
 
 Faial output:
 ```
-Kernel 'main_kernel' is DRF!
+Kernel 'main_kernel' has 2 data-races.
+~~~~ Data-race 1 (CIDI) ~~~~
+55 |     buf_dyn_shmem[0 * STAGE_SIZE + tid] = A[tid];
+56 |     buf_dyn_shmem[1 * STAGE_SIZE + tid] = B[tid];
+Locals: threadIdx x=0  vs  threadIdx x=4
+True alarm detected!
+
+~~~~ Data-race 2 (CIDI) ~~~~
+45 |         buf_dyn_shmem[i * STAGE_SIZE + tid] = 0.0f;
+Locals: i=0, threadIdx x=4  vs  i=1, threadIdx x=0
+True alarm detected!
 ```
 
-#### Why Faial Missed This Bug
+#### Important: These Races Are Artifacts of Our Simplification
 
-Same three reasons as GPUVerify — cannot parse real kernel, simplified
-kernel is genuinely race-free, and no TMA async model. Faial performs
-barrier-phase analysis at the thread level and has no visibility into
-H100 TMA hardware behavior.
+Faial detected 2 races — but these are **NOT the original H100 TMA bug**.
+They are introduced by a sizing mistake in our simplified kernel:
+
+- We used `STAGE_SIZE = 4` and `BLOCK_SIZE = 4`
+- Stage 0 occupies indices `0..3`, Stage 1 occupies indices `4..7`
+- Thread 4 writes `buf_dyn_shmem[0 * 4 + 4] = buf_dyn_shmem[4]` (stage 0)
+- Thread 0 writes `buf_dyn_shmem[1 * 4 + 0] = buf_dyn_shmem[4]` (stage 1)
+- Both write to **the same index 4** — a race caused by our simplification
+
+In the real kernel, `STAGE_SIZE = 4096` and `BLOCK_SIZE = 128` — stages
+never alias. Our simplified kernel accidentally created aliasing by making
+`STAGE_SIZE == BLOCK_SIZE`.
+
+This also reveals an important difference between GPUVerify and Faial:
+- **GPUVerify** uses theorem proving — it proved the simplified kernel safe
+  for all thread orderings, missing the stage aliasing
+- **Faial** uses SMT solving — Z3 solved the equation `0*4+4 = 1*4+0`
+  and found the aliasing, showing Faial is more precise at index arithmetic
+
+However, **the original H100 TMA race is still not detected by either tool**.
 
 ### Weft
 
@@ -265,41 +250,10 @@ H100 TMA hardware behavior.
 | Result | **No races detected** |
 | Classification | ❌ False Negative |
 | Race Type Missed | H100 TMA async pipeline race |
-| Weft Version | Built from source (github.com/lightsighter/Weft) |
-| Command | `weft -f kernel_clean.ptx -t 4 -i -d` |
-| PTX Compiled With | `nvcc -ptx kernel_weft.cu` (added `__launch_bounds__(128)`) |
-
-Weft output:
-```
-WEFT INFO: No deadlocks detected in kernel main_kernel!
-WEFT INFO: Barriers properly recycled in kernel main_kernel!
-WEFT INFO: No races detected in kernel main_kernel!
-WEFT STATISTICS for Kernel main_kernel
-  CTA Thread Count:                      128
-  Shared Memory Locations:               512
-  Physical Named Barriers;                 1
-  Dynamic Barrier Instances:              61
-  Total Race Tests:                   432512
-```
-
-#### Why Weft Missed This Bug
-
-Weft was designed for **named barrier** verification (`bar.sync N` /
-`bar.arrive N` in PTX) in warp-specialized kernels. The H100 `mbarrier`
-is a **fundamentally different** synchronization primitive:
-
-| Barrier Type | Weft Can Detect? | Purpose |
-|-------------|-----------------|---------|
-| `__syncthreads()` (`bar.sync 0`) | ✅ Yes | Thread synchronization |
-| Named barriers (`bar.sync N`) | ✅ Yes | Warp group sync — Weft's primary purpose |
-| `mbarrier` (TMA async) | ❌ No | TMA hardware sync — H100-specific, introduced 2022 |
 
 Weft was built in 2015 — `mbarrier` did not exist until H100 (2022).
-Weft has no model for TMA async operations and cannot detect missing or
-incorrect `mbarrier` usage.
-
-Additionally, same three reasons apply: cannot parse real kernel,
-simplified kernel is genuinely race-free, no TMA model.
+Weft has no model for TMA async operations. Same three reasons apply as
+GPUVerify: cannot parse real kernel, simplified kernel race-free, no TMA model.
 
 ---
 
@@ -307,15 +261,16 @@ simplified kernel is genuinely race-free, no TMA model.
 
 | Tool | Result | Classification | Notes |
 |------|--------|----------------|-------|
-| GPUVerify | Verified | ❌ False Negative | Cannot parse real kernel; simplified kernel genuinely race-free; no TMA model |
-| Faial | DRF | ❌ False Negative | Cannot parse real kernel; simplified kernel genuinely race-free; no TMA model |
-| Weft | No races detected | ❌ False Negative | Cannot parse real kernel; simplified kernel genuinely race-free; no mbarrier model |
+| GPUVerify | Verified (DRF) | ❌ False Negative | Proved simplified kernel safe; no TMA model |
+| Faial | 2 races (spurious) | ❌ FN for original bug | Races are simplification artifacts (STAGE_SIZE==BLOCK_SIZE aliasing); original H100 TMA race not detected |
+| Weft | No races detected | ❌ False Negative | No mbarrier model; simplified kernel race-free |
 
 ## Key Takeaway
 
-All three tools give False Negative for the same fundamental reason: **the
-race in #666 is an H100 TMA async pipeline race that operates at the hardware
-level, below the thread synchronization level that all three tools reason
-about.** Runtime confirmation requires actual H100 hardware where ~79.3%
-of output values are wrong. A future static analysis tool with sm_90+ TMA
-async semantics would be needed to detect this class of race statically.
+All three tools give **False Negative for the original H100 TMA race**
+because the race operates at the hardware level — between TMA engine and
+CUDA threads — below what any static thread-level tool can reason about.
+Faial uniquely found races in our simplified kernel due to its more precise
+SMT-based index arithmetic, but these are simplification artifacts unrelated
+to the original bug. Runtime confirmation requires actual H100 hardware
+where ~79.3% of output values are wrong.
