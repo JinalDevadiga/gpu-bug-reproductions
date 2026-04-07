@@ -1,20 +1,29 @@
 GPUVerify Analysis — TVM issue #10210
 ======================================
 Command:
-  python GPUVerify.py --cuda --blockDim=64 --gridDim=1 kernel_clean.cu
+  python GPUVerify.py --cuda --blockDim=26,16,1 --gridDim=1 kernel_clean.cu
 
 Output:
-  warning: Assuming the arguments 'C', 'A', 'B' of 'parallel_reduction_buggy'
-  to be non-aliased; please consider adding a restrict qualifier.
+  error: possible write-read race on red_buf0[344]:
+    Read  by thread (2,13,0): red_buf0[threadIdx.y*26 + threadIdx.x + 4]
+    Write by thread (6,13,0): red_buf0[threadIdx.y*26 + threadIdx.x]
 
-  error: possible read-write race on C[0]:
-    Write by thread 0 (global id 0): C[i*64+j] = C[i*64+j] + A[i*64+k] * B[k*64+j];
-    Read  by thread 1 (global id 1): C[i*64+j] = C[i*64+j] + A[i*64+k] * B[k*64+j];
+  error: possible read-write race on red_buf0[6]:
+    Write by thread (6,0,0): red_buf0[threadIdx.y*26 + threadIdx.x]
+    Read  by thread (2,0,0): red_buf0[threadIdx.y*26 + threadIdx.x + 4]
 
-  error: possible write-write race on C[0]:
-    Write by thread 0 (global id 0): C[i*64+j] = C[i*64+j] + A[i*64+k] * B[k*64+j];
-    Write by thread 1 (global id 1): C[i*64+j] = C[i*64+j] + A[i*64+k] * B[k*64+j];
+  error: possible write-read race on red_buf0[344]:
+    Read  by thread (4,13,0): red_buf0[threadIdx.y*26 + threadIdx.x + 2]
+    Write by thread (6,13,0): red_buf0[threadIdx.y*26 + threadIdx.x]
 
-  GPUVerify kernel analyser finished with 0 verified, 2 errors
+  error: possible read-write race on red_buf0[6]:
+    Write by thread (6,0,0): red_buf0[threadIdx.y*26 + threadIdx.x]
+    Read  by thread (2,0,0): red_buf0[threadIdx.y*26 + threadIdx.x + 4]
 
-Status: RACE DETECTED — 2 errors
+  error: possible read-write race on red_buf0[6]:
+    Write by thread (6,0,0): red_buf0[threadIdx.y*26 + threadIdx.x]
+    Read  by thread (2,0,0): red_buf0[threadIdx.y*26 + threadIdx.x + 4]
+
+  GPUVerify kernel analyser finished with 0 verified, 5 errors
+
+Status: RACE DETECTED — 5 errors
