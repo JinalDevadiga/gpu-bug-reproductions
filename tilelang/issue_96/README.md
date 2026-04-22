@@ -206,3 +206,51 @@ logic across iterations, which is outside Weft's verification scope.
 | GPUVerify | RACE DETECTED | ✅ True Positive | Detected write-write race in simplified kernel |
 | Faial | DRF | ❌ False Negative | Cannot reason across loop iterations |
 | Weft | No races detected | ❌ False Negative | Cannot reason across loop iterations; named-barrier focus |
+
+## PTX Analysis (-arch=sm_80)
+
+We compiled `kernel_clean.cu` with `-arch=sm_80` to inspect whether
+targeting A100/RTX 4070 Ti architecture changes the generated instructions:
+
+```bash
+nvcc -arch=sm_80 -ptx kernel_clean.cu -o kernel_sm80.ptx
+```
+
+The PTX shows only standard instructions even when targeting sm_80:
+```ptx
+.target sm_80          <- compiled for A100/RTX 4070 Ti architecture
+bar.sync 0             <- standard __syncthreads() — NOT cp.async
+st.shared.f32          <- standard shared memory store
+ld.global.nc.f32       <- standard global load — NOT cp.async.shared
+ld.shared.f32          <- standard shared memory load
+```
+
+**No async copy instructions appear** — no `cp.async`, no `cp.async.commit_group`,
+no `cp.async.wait_group`. This is because our simplified kernel uses standard
+C++ loads — compiling for sm_80 does not magically add async copy instructions.
+
+The real TileLang kernel on A100/RTX 4070 Ti would use:
+```ptx
+cp.async.ca.shared.global ...      // async copy from global to shared
+cp.async.commit_group              // commit async copy group
+cp.async.wait_group 0              // wait for async copies to complete
+```
+
+These are the sm80-specific instructions that cause the WAR hazard across
+pipeline iterations — and that our simplified kernel cannot model.
+
+### Key Distinction
+
+| Feature | Our simplified kernel | Real TileLang kernel on A100 |
+|---------|----------------------|------------------------------|
+| Load type | Standard `ld.global` | `cp.async` (async copy) |
+| Sync needed | `__syncthreads()` sufficient | `cp.async.wait_group` needed |
+| Race type GPUVerify found | Write-write between threads | WAR across pipeline iterations |
+| Architecture flag helps? | ❌ No — standard PTX generated | N/A — needs real A100 hardware |
+
+The write-write race GPUVerify detected in our simplified kernel and the
+WAR hazard in the real kernel both stem from the same root cause —
+**unsafe shared memory reuse across pipeline stages without proper barriers**.
+The True Positive is valid but the simplified kernel does not perfectly
+capture the `cp.async` async pipeline semantics of the original bug.
+
