@@ -158,3 +158,56 @@ a race.
 | GPUVerify | RACE DETECTED | ✅ True Positive | 2 errors — producer/consumer with no barrier |
 | Faial | RACE DETECTED | ✅ True Positive | 2 races — correctly identified missing barrier |
 | Weft | No races detected | ❌ False Negative | 0 dynamic barriers — vacuously safe result; designed for named-barrier kernels |
+
+## PTX Analysis (-arch=sm_90)
+
+We compiled `kernel_clean.cu` with `-arch=sm_90` to inspect whether
+targeting H100/RTX 5090 architecture changes the generated instructions:
+
+```bash
+nvcc -arch=sm_90 -ptx kernel_clean.cu -o kernel_sm90.ptx
+```
+
+The PTX shows only standard instructions even when targeting sm_90:
+```ptx
+.target sm_90              <- compiled for H100 architecture
+st.shared.f32              <- standard shared memory store
+ld.global.nc.f32           <- standard global load — NOT TMA
+ld.shared.f32              <- standard shared memory load
+```
+
+**No TMA instructions appear** — no `cp.async.bulk.tensor`, no `mbarrier.arrive`,
+no `mbarrier.wait`. This is because our simplified kernel uses standard C++
+loads — compiling for sm_90 does not add TMA semantics.
+
+Additionally the compiler **demoted** `s_x` and `s_y` from shared memory
+to registers in some paths:
+```ptx
+// _ZZ21warp_specialize_buggyPKfS0_PfE3s_x has been demoted
+// _ZZ21warp_specialize_buggyPKfS0_PfE3s_y has been demoted
+```
+This means the simplified kernel does not fully represent the real shared
+memory layout of the original Triton warp-specialized kernel.
+
+The real Triton kernel on H100/RTX 5090 would use:
+```ptx
+cp.async.bulk.tensor.2d.shared::cluster.global ...  // TMA async load
+mbarrier.arrive.expect_tx.shared::cta.b64 ...       // H100 barrier arrive
+mbarrier.wait.parity.shared::cta.b64 ...            // H100 barrier wait
+```
+
+### Key Distinction
+
+| Feature | Our simplified kernel | Real Triton kernel on H100 |
+|---------|----------------------|---------------------------|
+| Load type | Standard `ld.global` | TMA (`cp.async.bulk.tensor`) |
+| Sync needed | `__syncthreads()` | `mbarrier.arrive/wait` |
+| Race type GPUVerify found | Write-read between producer/consumer threads | Missing barrier before TMA completes |
+| Architecture flag helps? | ❌ No — standard PTX generated | N/A — needs real H100 hardware |
+| s_x/s_y location | Demoted to registers by compiler | Shared memory (warp-specialized) |
+
+The producer-consumer race GPUVerify detected in our simplified kernel
+and the TMA barrier race in the real kernel both stem from the same root
+cause — **missing synchronization between producer and consumer warps**.
+The True Positive is valid but the simplified kernel does not capture
+the TMA async semantics of the original warp-specialized Triton kernel.
